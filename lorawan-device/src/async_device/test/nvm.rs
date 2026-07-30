@@ -1,0 +1,457 @@
+//! Tests for LoRaWAN 1.0.4 persistence: monotonic DevNonce with commit-before-transmit,
+//! JoinNonce replay rejection, session resume across power loss, checkpoint wear-leveling
+//! and write dedup. "Power loss" is simulated by dropping the device and calling
+//! [`Device::restore`] against the same mock store.
+
+use super::radio::TestRadio;
+use super::timer::TestTimer;
+use super::{region, JoinResponse, SendResponse};
+use crate::mac::{NetworkCredentials, Session};
+use crate::nvm::{
+    NonVolatileStoreSync, NvmRegion, PersistentIdentity, PersistentSession, MAX_BLOB_LEN,
+};
+use crate::test_util::{get_key, get_otaa_credentials, Uplink};
+use crate::{AppEui, AppKey, DevEui};
+use lorawan::creator::DataPayloadCreator;
+use lorawan::default_crypto::DefaultFactory;
+use lorawan::parser::{parse, DataHeader, DataPayload, JoinAcceptPayload, PhyPayload};
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::sync::{Arc, LazyLock, Mutex};
+
+type Device =
+    crate::async_device::Device<TestRadio, TestTimer, rand_core::OsRng, 512, 4, MockStore>;
+
+#[derive(Default)]
+struct Inner {
+    slots: [Option<Vec<u8>>; 2],
+    saves: [usize; 2],
+}
+
+/// In-memory store implementing the *sync* trait; the device consumes it through the
+/// blanket async impl, so these tests cover that path too.
+#[derive(Clone, Default)]
+struct MockStore {
+    inner: Arc<Mutex<Inner>>,
+}
+
+fn slot(region: NvmRegion) -> usize {
+    match region {
+        NvmRegion::Identity => 0,
+        NvmRegion::Session => 1,
+    }
+}
+
+impl MockStore {
+    fn blob(&self, region: NvmRegion) -> Option<Vec<u8>> {
+        self.inner.lock().unwrap().slots[slot(region)].clone()
+    }
+
+    fn saves(&self, region: NvmRegion) -> usize {
+        self.inner.lock().unwrap().saves[slot(region)]
+    }
+
+    fn identity(&self) -> PersistentIdentity {
+        PersistentIdentity::decode(&self.blob(NvmRegion::Identity).unwrap()).unwrap()
+    }
+
+    fn session(&self) -> PersistentSession {
+        PersistentSession::decode(&self.blob(NvmRegion::Session).unwrap()).unwrap()
+    }
+
+    fn put(&self, region: NvmRegion, bytes: &[u8]) {
+        self.inner.lock().unwrap().slots[slot(region)] = Some(bytes.to_vec());
+    }
+
+    fn corrupt(&self, region: NvmRegion) {
+        let mut inner = self.inner.lock().unwrap();
+        let blob = inner.slots[slot(region)].as_mut().unwrap();
+        *blob.last_mut().unwrap() ^= 0x01;
+    }
+}
+
+impl NonVolatileStoreSync for MockStore {
+    type Error = Infallible;
+
+    fn save(&mut self, region: NvmRegion, bytes: &[u8]) -> Result<(), Infallible> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.slots[slot(region)] = Some(bytes.to_vec());
+        inner.saves[slot(region)] += 1;
+        Ok(())
+    }
+
+    fn load(&mut self, region: NvmRegion, buf: &mut [u8]) -> Result<Option<usize>, Infallible> {
+        Ok(self.inner.lock().unwrap().slots[slot(region)].as_ref().map(|blob| {
+            buf[..blob.len()].copy_from_slice(blob);
+            blob.len()
+        }))
+    }
+}
+
+async fn restore(
+    store: &MockStore,
+) -> (super::radio::RadioChannel, super::timer::TimerChannel, Device) {
+    let (radio_channel, mock_radio) = TestRadio::new();
+    let (timer_channel, mock_timer) = TestTimer::new();
+    let region = region::US915::default();
+    let device =
+        Device::restore(region.into(), mock_radio, mock_timer, rand_core::OsRng, store.clone())
+            .await
+            .unwrap();
+    (radio_channel, timer_channel, device)
+}
+
+/// Sessions derived by the "network side" during joins, keyed by test id, so data
+/// handlers can validate and encrypt against the real derived keys.
+static NETWORK_SESSIONS: LazyLock<Mutex<HashMap<usize, Session>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Network-side join handler: asserts the transmitted DevNonce equals `EXPECT_DEV_NONCE`
+/// (monotonic counter), answers with JoinNonce `NONCE` and stores the derived session
+/// under test id `T`.
+fn join_accept<const T: usize, const NONCE: u8, const EXPECT_DEV_NONCE: u16>(
+    uplink: Option<Uplink>,
+    _config: crate::radio::RfConfig,
+    rx_buffer: &mut [u8],
+) -> usize {
+    let mut uplink = uplink.expect("no uplink");
+    let PhyPayload::JoinRequest(join_request) = uplink.get_payload() else {
+        panic!("not a join request");
+    };
+    assert!(join_request.validate_mic(&get_key().into(), &DefaultFactory));
+    let dev_nonce = join_request.dev_nonce().to_owned();
+    assert_eq!(u16::from(dev_nonce), EXPECT_DEV_NONCE, "DevNonce not the expected counter value");
+
+    let mut buffer: [u8; 17] = [0; 17];
+    let mut phy = lorawan::creator::JoinAcceptCreator::new(&mut buffer[..]).unwrap();
+    phy.set_app_nonce(&[NONCE, 0, 0]);
+    phy.set_net_id(&[1; 3]);
+    phy.set_dev_addr(crate::test_util::get_dev_addr());
+    let finished = phy.build(&get_key().into(), &DefaultFactory).unwrap();
+    rx_buffer[..finished.len()].copy_from_slice(finished);
+    let len = finished.len();
+
+    let mut copy = rx_buffer[..len].to_vec();
+    let PhyPayload::JoinAccept(JoinAcceptPayload::Encrypted(encrypted)) =
+        parse(copy.as_mut_slice()).unwrap()
+    else {
+        panic!("could not parse own join accept");
+    };
+    let decrypt = encrypted.decrypt(&get_key().into(), &DefaultFactory);
+    let session = Session::derive_new(
+        &decrypt,
+        dev_nonce,
+        &NetworkCredentials::new(
+            AppEui::from([0; 8]),
+            DevEui::from([0; 8]),
+            AppKey::from(get_key()),
+        ),
+    );
+    NETWORK_SESSIONS.lock().unwrap().insert(T, session);
+    len
+}
+
+/// Network-side data handler: validates the uplink against the session derived at join
+/// time for test id `T`, asserts its FCnt, and answers with a downlink at `FCNT_DOWN`.
+fn data_downlink<const T: usize, const FCNT_UP: u16, const FCNT_DOWN: u32>(
+    uplink: Option<Uplink>,
+    _config: crate::radio::RfConfig,
+    rx_buffer: &mut [u8],
+) -> usize {
+    let session = NETWORK_SESSIONS.lock().unwrap().get(&T).cloned().unwrap();
+    let mut uplink = uplink.expect("no uplink");
+    let PhyPayload::Data(DataPayload::Encrypted(data)) = uplink.get_payload() else {
+        panic!("not a data payload");
+    };
+    let fcnt = data.fhdr().fcnt() as u32;
+    assert!(data.validate_mic(session.nwkskey().inner(), fcnt, &DefaultFactory));
+    assert_eq!(fcnt as u16, FCNT_UP, "uplink FCnt mismatch");
+
+    let mut phy = DataPayloadCreator::new(rx_buffer).unwrap();
+    phy.set_confirmed(false);
+    phy.set_f_port(4);
+    phy.set_dev_addr(session.devaddr);
+    phy.set_uplink(false);
+    phy.set_fcnt(FCNT_DOWN);
+    phy.build(&[3, 2, 1], [], &session.nwkskey, &session.appskey, &DefaultFactory).unwrap().len()
+}
+
+#[tokio::test]
+async fn failed_join_still_burns_a_durable_dev_nonce() {
+    let store = MockStore::default();
+    let (radio, timer, mut device) = restore(&store).await;
+
+    let task = tokio::spawn(async move { device.join(&get_otaa_credentials()).await });
+    timer.fire_most_recent().await; // RX1 open
+    radio.handle_timeout().await; // RX1 timeout
+    timer.fire_most_recent().await; // RX2 open
+    radio.handle_timeout().await; // RX2 timeout
+    assert!(matches!(task.await.unwrap(), Ok(JoinResponse::NoJoinAccept)));
+
+    // DevNonce 0 went on the air and its increment was committed, despite no accept.
+    let identity = store.identity();
+    assert_eq!(identity.dev_nonce, 1);
+    assert_eq!(identity.last_join_nonce, None);
+    assert_eq!(identity.join_epoch, 0);
+    // No session was written.
+    assert!(store.blob(NvmRegion::Session).is_none());
+}
+
+#[tokio::test]
+async fn dev_nonce_monotonic_across_power_loss() {
+    const T: usize = 1;
+    let store = MockStore::default();
+
+    // First boot, first join: DevNonce 0.
+    let (radio, timer, mut device) = restore(&store).await;
+    let task = tokio::spawn(async move { device.join(&get_otaa_credentials()).await });
+    timer.fire_most_recent().await;
+    radio.handle_rxtx(join_accept::<T, 1, 0>).await;
+    assert!(matches!(task.await.unwrap(), Ok(JoinResponse::JoinSuccess)));
+    let identity = store.identity();
+    assert_eq!(
+        (identity.dev_nonce, identity.last_join_nonce, identity.join_epoch),
+        (1, Some(1), 1)
+    );
+
+    // Power loss. Next join must use DevNonce 1, not restart at 0 or draw randomly.
+    let (radio, timer, mut device) = restore(&store).await;
+    let task = tokio::spawn(async move { device.join(&get_otaa_credentials()).await });
+    timer.fire_most_recent().await;
+    radio.handle_rxtx(join_accept::<T, 2, 1>).await;
+    assert!(matches!(task.await.unwrap(), Ok(JoinResponse::JoinSuccess)));
+    let identity = store.identity();
+    assert_eq!(
+        (identity.dev_nonce, identity.last_join_nonce, identity.join_epoch),
+        (2, Some(2), 2)
+    );
+}
+
+#[tokio::test]
+async fn replayed_join_accept_rejected() {
+    const T: usize = 2;
+    let store = MockStore::default();
+    let (radio, timer, mut device) = restore(&store).await;
+
+    // Legitimate join with JoinNonce 5.
+    let task = tokio::spawn(async move {
+        let r = device.join(&get_otaa_credentials()).await;
+        (device, r)
+    });
+    timer.fire_most_recent().await;
+    radio.handle_rxtx(join_accept::<T, 5, 0>).await;
+    let (mut device, response) = task.await.unwrap();
+    assert!(matches!(response, Ok(JoinResponse::JoinSuccess)));
+    let joined_epoch = store.identity().join_epoch;
+
+    // An attacker replays a captured accept (JoinNonce 5 again): must be ignored,
+    // ending in NoJoinAccept after both windows.
+    let task = tokio::spawn(async move {
+        let r = device.join(&get_otaa_credentials()).await;
+        (device, r)
+    });
+    timer.fire_most_recent().await; // RX1 open
+
+    // The replayed nonce is ignored; give the device time to reject the frame and arm
+    // the RX2 timer.
+    radio.handle_rxtx(join_accept::<T, 5, 1>).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(15)).await;
+    timer.fire_most_recent().await; // RX2 open
+    radio.handle_timeout().await; // RX2 timeout
+    let (mut device, response) = task.await.unwrap();
+    assert!(matches!(response, Ok(JoinResponse::NoJoinAccept)));
+    assert_eq!(store.identity().join_epoch, joined_epoch, "epoch must not advance on replay");
+
+    // A fresh accept with a LOWER JoinNonce is accepted: 1.0.4 servers guarantee only
+    // non-repetition, not monotonicity, so anything different from the last must pass.
+    let task = tokio::spawn(async move {
+        let r = device.join(&get_otaa_credentials()).await;
+        (device, r)
+    });
+    timer.fire_most_recent().await;
+    radio.handle_rxtx(join_accept::<T, 3, 2>).await;
+    let (mut device, response) = task.await.unwrap();
+    assert!(matches!(response, Ok(JoinResponse::JoinSuccess)));
+    assert_eq!(store.identity().last_join_nonce, Some(3));
+
+    // The replay floor tracks only the latest accept: nonce 5 is from two joins ago,
+    // no longer the last accepted value, so it passes now.
+    let task = tokio::spawn(async move { device.join(&get_otaa_credentials()).await });
+    timer.fire_most_recent().await;
+    radio.handle_rxtx(join_accept::<T, 5, 3>).await;
+    assert!(matches!(task.await.unwrap(), Ok(JoinResponse::JoinSuccess)));
+    assert_eq!(store.identity().last_join_nonce, Some(5));
+}
+
+#[tokio::test]
+async fn session_resumes_after_power_loss() {
+    const T: usize = 3;
+    let store = MockStore::default();
+    let (radio, timer, mut device) = restore(&store).await;
+
+    // Join and send one uplink (FCnt 0), no downlink.
+    let task = tokio::spawn(async move {
+        let r = device.join(&get_otaa_credentials()).await;
+        (device, r)
+    });
+    timer.fire_most_recent().await;
+    radio.handle_rxtx(join_accept::<T, 1, 0>).await;
+    let (mut device, response) = task.await.unwrap();
+    assert!(matches!(response, Ok(JoinResponse::JoinSuccess)));
+    let keys_before = device.get_session().unwrap().get_session_keys().unwrap();
+
+    let task = tokio::spawn(async move { device.send(&[1, 2, 3], 3, false).await });
+    timer.fire_most_recent().await;
+    radio.handle_timeout().await;
+    timer.fire_most_recent().await;
+    radio.handle_timeout().await;
+    assert!(matches!(task.await.unwrap(), Ok(SendResponse::RxComplete)));
+
+    // Cold boot with total RAM loss.
+    let (radio, timer, mut device) = restore(&store).await;
+    let session = device.get_session().expect("session must resume");
+    let keys_after = session.get_session_keys().unwrap();
+    assert_eq!(format!("{keys_before:?}"), format!("{keys_after:?}"));
+    // FCnt resumes from the persisted checkpoint (join set it to the margin), skipping
+    // ahead of the single counter value actually used; never reusing one.
+    assert_eq!(session.fcnt_up, crate::nvm::DEFAULT_FCNT_CHECKPOINT_MARGIN);
+
+    // The resumed session can send immediately and accept a downlink.
+    let task = tokio::spawn(async move {
+        let r = device.send(&[1, 2, 3], 3, false).await;
+        (device, r)
+    });
+    timer.fire_most_recent().await;
+    radio.handle_rxtx(data_downlink::<T, 32, 1>).await;
+    let (_device, response) = task.await.unwrap();
+    assert!(matches!(response, Ok(SendResponse::DownlinkReceived(1))));
+    // The advanced downlink counter (replay floor) was persisted at its exact value.
+    assert_eq!(store.session().fcnt_down, Some(1));
+}
+
+#[tokio::test]
+async fn stale_or_corrupt_session_dropped_identity_kept() {
+    // Session blob from an older join epoch: identity survives, session does not.
+    let store = MockStore::default();
+    let identity = PersistentIdentity { dev_nonce: 7, last_join_nonce: Some(3), join_epoch: 5 };
+    let mut buf = [0u8; MAX_BLOB_LEN];
+    let n = identity.encode(&mut buf);
+    store.put(NvmRegion::Identity, &buf[..n]);
+    let stale = PersistentSession {
+        nwkskey: crate::NwkSKey::from(get_key()),
+        appskey: crate::AppSKey::from(get_key()),
+        devaddr: crate::test_util::get_dev_addr(),
+        fcnt_up_checkpoint: 100,
+        fcnt_down: Some(9),
+        join_epoch: 4, // does not match identity epoch 5
+        data_rate: lorawan::types::DR::_0,
+        rx1_delay: 1000,
+        rx1_dr_offset: 0,
+        rx2_data_rate: None,
+        rx2_frequency: None,
+        tx_power: None,
+    };
+    let n = stale.encode(&mut buf);
+    store.put(NvmRegion::Session, &buf[..n]);
+
+    let (radio, timer, mut device) = restore(&store).await;
+    assert!(device.get_session().is_none(), "stale-epoch session must not resume");
+
+    // The kept identity still drives the join path: DevNonce continues at 7.
+    let task = tokio::spawn(async move { device.join(&get_otaa_credentials()).await });
+    timer.fire_most_recent().await;
+    radio.handle_rxtx(join_accept::<4, 4, 7>).await;
+    assert!(matches!(task.await.unwrap(), Ok(JoinResponse::JoinSuccess)));
+    assert_eq!(store.identity().dev_nonce, 8);
+
+    // Corrupt (torn) session blob: same outcome.
+    let matching = PersistentSession { join_epoch: 6, ..stale };
+    let n = matching.encode(&mut buf);
+    store.put(NvmRegion::Session, &buf[..n]);
+    let (_radio, _timer, mut device) = restore(&store).await;
+    assert!(device.get_session().is_some(), "sanity: matching-epoch session resumes");
+    store.corrupt(NvmRegion::Session);
+    let (_radio, _timer, mut device) = restore(&store).await;
+    assert!(device.get_session().is_none(), "corrupt session must not resume");
+}
+
+#[tokio::test]
+async fn checkpoint_margin_gates_session_writes() {
+    const T: usize = 5;
+    let store = MockStore::default();
+    let (radio, timer, mut device) = restore(&store).await;
+    device.set_checkpoint_margin(2);
+
+    let task = tokio::spawn(async move {
+        let r = device.join(&get_otaa_credentials()).await;
+        (device, r)
+    });
+    timer.fire_most_recent().await;
+    radio.handle_rxtx(join_accept::<T, 1, 0>).await;
+    let (mut device, response) = task.await.unwrap();
+    assert!(matches!(response, Ok(JoinResponse::JoinSuccess)));
+    let saves_after_join = store.saves(NvmRegion::Session);
+    assert_eq!(store.session().fcnt_up_checkpoint, 2);
+
+    // FCnt 0 and 1 are below the persisted checkpoint: no writes.
+    for _ in 0..2 {
+        let task = tokio::spawn(async move {
+            let r = device.send(&[1, 2, 3], 3, false).await;
+            (device, r)
+        });
+        timer.fire_most_recent().await;
+        radio.handle_timeout().await;
+        timer.fire_most_recent().await;
+        radio.handle_timeout().await;
+        let (d, response) = task.await.unwrap();
+        assert!(matches!(response, Ok(SendResponse::RxComplete)));
+        device = d;
+    }
+    assert_eq!(store.saves(NvmRegion::Session), saves_after_join);
+
+    // FCnt 2 reaches the checkpoint: the blob is rewritten (before transmit) with the
+    // next checkpoint at 2 + margin.
+    let task = tokio::spawn(async move {
+        let r = device.send(&[1, 2, 3], 3, false).await;
+        (device, r)
+    });
+    timer.fire_most_recent().await;
+    radio.handle_timeout().await;
+    timer.fire_most_recent().await;
+    radio.handle_timeout().await;
+    let (_device, response) = task.await.unwrap();
+    assert!(matches!(response, Ok(SendResponse::RxComplete)));
+    assert_eq!(store.saves(NvmRegion::Session), saves_after_join + 1);
+    assert_eq!(store.session().fcnt_up_checkpoint, 4);
+}
+
+#[tokio::test]
+async fn explicit_checkpoint_dedups_unchanged_state() {
+    const T: usize = 6;
+    let store = MockStore::default();
+    let (radio, timer, mut device) = restore(&store).await;
+
+    let task = tokio::spawn(async move {
+        let r = device.join(&get_otaa_credentials()).await;
+        (device, r)
+    });
+    timer.fire_most_recent().await;
+    radio.handle_rxtx(join_accept::<T, 1, 0>).await;
+    let (mut device, response) = task.await.unwrap();
+    assert!(matches!(response, Ok(JoinResponse::JoinSuccess)));
+
+    // First checkpoint moves the resume point from margin (32) to the live counter (0):
+    // one session write, identity unchanged so no identity write.
+    let identity_saves = store.saves(NvmRegion::Identity);
+    let session_saves = store.saves(NvmRegion::Session);
+    device.checkpoint().await.unwrap();
+    assert_eq!(store.saves(NvmRegion::Session), session_saves + 1);
+    assert_eq!(store.saves(NvmRegion::Identity), identity_saves);
+    assert_eq!(store.session().fcnt_up_checkpoint, 0);
+
+    // Second checkpoint with identical state: both writes deduped away.
+    let session_saves = store.saves(NvmRegion::Session);
+    device.checkpoint().await.unwrap();
+    assert_eq!(store.saves(NvmRegion::Session), session_saves);
+    assert_eq!(store.saves(NvmRegion::Identity), identity_saves);
+}

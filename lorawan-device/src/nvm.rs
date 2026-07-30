@@ -6,8 +6,8 @@
 //! persistence, exactly as before this module existed.
 //!
 //! The version is not a runtime setting; it is a consequence of the store type, resolved
-//! at compile time via [`NonVolatileStore::PERSISTENT`]. See `DESIGN-persistence.md` for
-//! the full rationale.
+//! at compile time via [`NonVolatileStore::PERSISTENT`], so a 1.0.2 build cannot believe
+//! it is 1.0.4 with nowhere to persist its anti-replay state.
 //!
 //! Two logical regions are stored, split because their write rates differ by orders of
 //! magnitude:
@@ -46,7 +46,9 @@ pub const MAX_BLOB_LEN: usize = 96;
 /// Default headroom persisted ahead of the live uplink frame counter. The `Session`
 /// region is rewritten only when the live counter reaches the persisted checkpoint, and
 /// boot resumes *from* the checkpoint, guaranteeing no counter reuse at the cost of
-/// skipping up to this many values per power cycle (the network allows a gap of 16384).
+/// skipping up to this many values per power cycle. The network tolerates the skip: a
+/// 1.0.2 server allows a gap up to MAX_FCNT_GAP (16384) and 1.0.4 removed the gap limit
+/// entirely.
 pub const DEFAULT_FCNT_CHECKPOINT_MARGIN: u32 = 32;
 
 /// User-supplied non-volatile store, asynchronous flavor. One instance backs the whole
@@ -138,8 +140,11 @@ impl NonVolatileStoreSync for NoNvm {
 pub struct PersistentIdentity {
     /// 1.0.4 monotonic join counter; +1 per JoinRequest, never resets.
     pub dev_nonce: u16,
-    /// Highest JoinNonce accepted; any JoinAccept not strictly greater is rejected.
-    /// `None` until the first successful join.
+    /// JoinNonce of the last accepted JoinAccept; an accept carrying an equal value is
+    /// rejected as a replay. Equality (not strictly-greater, which is the LoRaWAN 1.1
+    /// rule) is the strongest check compatible with 1.0.4 servers, whose JoinNonce is
+    /// only guaranteed non-repeating, not monotonic. `None` until the first successful
+    /// join.
     pub last_join_nonce: Option<u32>,
     /// Bumps on each successful join; ties a session blob to this identity.
     pub join_epoch: u32,
@@ -154,12 +159,13 @@ pub struct PersistentSession {
     pub devaddr: DevAddr<[u8; 4]>,
     /// Boot resumes `fcnt_up` from here; always ahead of any counter that went on air.
     pub fcnt_up_checkpoint: u32,
-    /// Exact last-accepted downlink counter (downlinks are rare; no wear concern).
-    pub fcnt_down: u32,
+    /// Exact last-accepted downlink counter, `None` before the session's first
+    /// downlink (downlinks are rare; no wear concern).
+    pub fcnt_down: Option<u32>,
     /// Must equal `PersistentIdentity::join_epoch` or the session is stale.
     pub join_epoch: u32,
     // Negotiated MAC state. Channel-plan state is not yet persisted; adding it later is
-    // a schema_version bump (see DESIGN-persistence.md §6).
+    // a schema_version bump.
     pub data_rate: DR,
     pub rx1_delay: u32,
     pub rx1_dr_offset: u8,
@@ -190,7 +196,7 @@ const HEADER_LEN: usize = 12;
 const IDENTITY_SCHEMA_VERSION: u8 = 1;
 const SESSION_SCHEMA_VERSION: u8 = 1;
 const IDENTITY_PAYLOAD_LEN: usize = 10;
-const SESSION_PAYLOAD_LEN: usize = 60;
+const SESSION_PAYLOAD_LEN: usize = 61;
 /// Sentinel encoding of `last_join_nonce: None`; JoinNonce is a 3-byte field on the
 /// wire, so this value can never be a real nonce.
 const JOIN_NONCE_NONE: u32 = 0xFFFF_FFFF;
@@ -291,7 +297,7 @@ impl PersistentSession {
         p[16..32].copy_from_slice(&self.appskey.inner().0);
         p[32..36].copy_from_slice(self.devaddr.as_ref());
         p[36..40].copy_from_slice(&self.fcnt_up_checkpoint.to_le_bytes());
-        p[40..44].copy_from_slice(&self.fcnt_down.to_le_bytes());
+        p[40..44].copy_from_slice(&self.fcnt_down.unwrap_or(0).to_le_bytes());
         p[44..48].copy_from_slice(&self.join_epoch.to_le_bytes());
         p[48] = self.data_rate as u8;
         p[49..53].copy_from_slice(&self.rx1_delay.to_le_bytes());
@@ -299,6 +305,7 @@ impl PersistentSession {
         p[54] = self.rx2_data_rate.map_or(0xFF, |dr| dr as u8);
         p[55..59].copy_from_slice(&self.rx2_frequency.unwrap_or(0).to_le_bytes());
         p[59] = self.tx_power.unwrap_or(0xFF);
+        p[60] = self.fcnt_down.is_some() as u8;
         encode_blob(NvmRegion::Session, &p, out)
     }
 
@@ -317,7 +324,7 @@ impl PersistentSession {
             appskey: AppSKey::from(appskey),
             devaddr: DevAddr::new([p[32], p[33], p[34], p[35]]).unwrap(),
             fcnt_up_checkpoint: u32::from_le_bytes([p[36], p[37], p[38], p[39]]),
-            fcnt_down: u32::from_le_bytes([p[40], p[41], p[42], p[43]]),
+            fcnt_down: (p[60] != 0).then(|| u32::from_le_bytes([p[40], p[41], p[42], p[43]])),
             join_epoch: u32::from_le_bytes([p[44], p[45], p[46], p[47]]),
             data_rate: DR::from(p[48]),
             rx1_delay: u32::from_le_bytes([p[49], p[50], p[51], p[52]]),
@@ -343,7 +350,7 @@ mod tests {
             appskey: AppSKey::from([2; 16]),
             devaddr: DevAddr::new([1, 2, 3, 4]).unwrap(),
             fcnt_up_checkpoint: 320,
-            fcnt_down: 17,
+            fcnt_down: Some(17),
             join_epoch: 3,
             data_rate: DR::_2,
             rx1_delay: 5000,

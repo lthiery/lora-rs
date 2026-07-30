@@ -1,4 +1,5 @@
 use super::{del_to_delay_ms, session::Session, Response};
+use crate::nvm::PersistentIdentity;
 use crate::radio::RadioBuffer;
 use crate::region::Configuration;
 use crate::{AppEui, AppKey, DevEui};
@@ -30,12 +31,16 @@ impl Otaa {
 
     /// Prepare a join request to be sent. This populates the radio buffer with the request to be
     /// sent, and returns the radio config to use for transmitting.
+    ///
+    /// `dev_nonce` selects the LoRaWAN 1.0.4 monotonic counter value when persistence is
+    /// available; `None` falls back to the 1.0.2 random draw.
     pub(crate) fn prepare_buffer<G: RngCore, const N: usize>(
         &mut self,
         rng: &mut G,
+        dev_nonce: Option<u16>,
         buf: &mut RadioBuffer<N>,
     ) -> u16 {
-        self.dev_nonce = DevNonce::from(rng.next_u32() as u16);
+        self.dev_nonce = DevNonce::from(dev_nonce.unwrap_or_else(|| rng.next_u32() as u16));
         buf.clear();
         let mut phy = JoinRequestCreator::new(buf.as_mut()).unwrap();
         phy.set_app_eui(self.network_credentials.appeui)
@@ -51,6 +56,7 @@ impl Otaa {
         &mut self,
         region: &mut Configuration,
         configuration: &mut super::Configuration,
+        identity: Option<&mut PersistentIdentity>,
         rx: &mut RadioBuffer<N>,
     ) -> Option<Session> {
         if let Ok(PhyPayload::JoinAccept(JoinAcceptPayload::Encrypted(encrypted))) =
@@ -61,6 +67,24 @@ impl Otaa {
             // TODO: dlsettings (rx1_dr_offset / rx2_datarate)
             configuration.rx1_delay = del_to_delay_ms(decrypt.rx_delay());
             if decrypt.validate_mic(&self.network_credentials.appkey, &DefaultFactory) {
+                if let Some(identity) = identity {
+                    // A JoinAccept whose JoinNonce equals the last accepted one is a
+                    // replay of that accept: its MIC does not cover our DevNonce, so it
+                    // validates in a later join window while key derivation silently
+                    // diverges from the network. 1.0.4 guarantees only that the server's
+                    // JoinNonce is non-repeating (monotonicity is a 1.1 contract), so a
+                    // fresh accept is never equal to the last but may well be lower;
+                    // equality is the strongest test that cannot reject a compliant
+                    // server.
+                    let n = decrypt.app_nonce();
+                    let n = n.as_ref();
+                    let join_nonce = u32::from_le_bytes([n[0], n[1], n[2], 0]);
+                    if identity.last_join_nonce == Some(join_nonce) {
+                        return None;
+                    }
+                    identity.last_join_nonce = Some(join_nonce);
+                    identity.join_epoch = identity.join_epoch.wrapping_add(1);
+                }
                 return Some(Session::derive_new(
                     &decrypt,
                     self.dev_nonce,

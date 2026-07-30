@@ -11,6 +11,10 @@ use rand_core::RngCore;
 
 pub use crate::region::DR;
 use crate::{
+    nvm::{
+        NoNvm, NonVolatileStore, NvmRegion, PersistentIdentity, PersistentSession,
+        DEFAULT_FCNT_CHECKPOINT_MARGIN, MAX_BLOB_LEN,
+    },
     radio::{RadioBuffer, RfConfig, RxConfig},
     rng,
 };
@@ -60,11 +64,17 @@ use self::radio::RxStatus;
 /// that may be buffered. The defaults are 256 and 1 respectively which should be fine for Class A devices. **For Class
 /// C operation**, it is recommended to increase D to at least 2, if not 3. This is because during the RX1/RX2 windows
 /// after a Class A transmit, it is possible to receive Class C downlinks (in additional to any RX1/RX2 responses!).
-pub struct Device<R, T, G, const N: usize = 256, const D: usize = 1>
+///
+/// The optional type S is a user-supplied [`NonVolatileStore`]. Providing one (via
+/// [`Device::restore`]) enables LoRaWAN 1.0.4 behavior: monotonic DevNonce, JoinNonce replay
+/// protection and full session resume across power loss. The default [`NoNvm`] keeps the stack
+/// at LoRaWAN 1.0.2 with no persistence code compiled in.
+pub struct Device<R, T, G, const N: usize = 256, const D: usize = 1, S = NoNvm>
 where
     R: radio::PhyRxTx + Timings,
     T: radio::Timer,
     G: RngCore,
+    S: NonVolatileStore,
 {
     radio: R,
     /// Access to provided (pseudo)-random number generator.
@@ -73,6 +83,11 @@ where
     mac: Mac,
     radio_buffer: RadioBuffer<N>,
     downlink: Vec<Downlink, D>,
+    store: S,
+    /// Persisted FCntUp resume point; the session blob is rewritten before transmitting
+    /// any uplink whose counter reaches this value.
+    fcnt_up_checkpoint: u32,
+    checkpoint_margin: u32,
     #[cfg(feature = "class-c")]
     class_c: bool,
 }
@@ -82,6 +97,9 @@ where
 pub enum Error<R> {
     Radio(R),
     Mac(mac::Error),
+    /// The non-volatile store failed a save at a commit point that must not proceed
+    /// without durability (e.g. DevNonce before a join request).
+    Nvm,
 }
 
 #[cfg_attr(feature = "defmt-03", derive(defmt::Format))]
@@ -165,7 +183,7 @@ where
     }
 }
 
-impl<R, T, G, const N: usize, const D: usize> Device<R, T, G, N, D>
+impl<R, T, G, const N: usize, const D: usize> Device<R, T, G, N, D, NoNvm>
 where
     R: radio::PhyRxTx + Timings,
     T: radio::Timer,
@@ -199,9 +217,96 @@ where
             radio_buffer: RadioBuffer::new(),
             timer,
             downlink: Vec::new(),
+            store: NoNvm,
+            fcnt_up_checkpoint: 0,
+            checkpoint_margin: DEFAULT_FCNT_CHECKPOINT_MARGIN,
             #[cfg(feature = "class-c")]
             class_c: false,
         }
+    }
+}
+
+impl<R, T, G, const N: usize, const D: usize, S> Device<R, T, G, N, D, S>
+where
+    R: radio::PhyRxTx + Timings,
+    T: radio::Timer,
+    G: RngCore,
+    S: NonVolatileStore,
+{
+    /// Create a [`Device`] backed by a non-volatile store, restoring any persisted state.
+    /// This is the only constructor for persistent (LoRaWAN 1.0.4) operation, which keeps
+    /// the load-before-use rule unskippable.
+    ///
+    /// Boot flow: a missing or corrupt identity blob means
+    /// first boot (fresh counters, unjoined); a session blob is resumed only when intact and
+    /// tied to the current identity epoch, otherwise it is discarded while the identity
+    /// counters are kept, so the next join still uses a monotonic DevNonce.
+    ///
+    /// Only store access errors are surfaced; corruption is handled by falling back as
+    /// described. The caller must supply the same region configuration the persisted state
+    /// was written under.
+    pub async fn restore(
+        region: region::Configuration,
+        radio: R,
+        timer: T,
+        rng: G,
+        mut store: S,
+    ) -> Result<Self, S::Error> {
+        let mut mac = Mac::new(region, R::MAX_RADIO_POWER, R::ANTENNA_GAIN);
+        let mut fcnt_up_checkpoint = 0;
+        if S::PERSISTENT {
+            let mut buf = [0u8; MAX_BLOB_LEN];
+            let identity = match store.load(NvmRegion::Identity, &mut buf).await? {
+                Some(n) => PersistentIdentity::decode(&buf[..n]).ok(),
+                None => None,
+            };
+            if let Some(identity) = identity {
+                if let Some(n) = store.load(NvmRegion::Session, &mut buf).await? {
+                    if let Ok(ps) = PersistentSession::decode(&buf[..n]) {
+                        if ps.join_epoch == identity.join_epoch {
+                            fcnt_up_checkpoint = ps.fcnt_up_checkpoint;
+                            mac.restore_session(&ps);
+                        }
+                    }
+                }
+                mac.set_identity(identity);
+            } else {
+                mac.set_identity(PersistentIdentity::default());
+            }
+        }
+        Ok(Self {
+            radio,
+            rng,
+            mac,
+            radio_buffer: RadioBuffer::new(),
+            timer,
+            downlink: Vec::new(),
+            store,
+            fcnt_up_checkpoint,
+            checkpoint_margin: DEFAULT_FCNT_CHECKPOINT_MARGIN,
+            #[cfg(feature = "class-c")]
+            class_c: false,
+        })
+    }
+
+    /// Adjust how far ahead of the live uplink counter the persisted resume point is kept.
+    /// Higher values mean fewer flash writes but a larger counter skip after each power
+    /// cycle. Defaults to [`DEFAULT_FCNT_CHECKPOINT_MARGIN`].
+    pub fn set_checkpoint_margin(&mut self, margin: u32) {
+        self.checkpoint_margin = margin.max(1);
+    }
+
+    /// Flush identity and session state to the store, with the resume point set to the
+    /// exact live counter, ahead of a planned power-down. No-op without a real store.
+    pub async fn checkpoint(&mut self) -> Result<(), Error<R::PhyError>> {
+        if S::PERSISTENT {
+            if let Some(fcnt_up) = self.mac.get_fcnt_up() {
+                self.fcnt_up_checkpoint = fcnt_up;
+            }
+            persist_identity(&self.mac, &mut self.store).await?;
+            persist_session(&self.mac, &mut self.store, self.fcnt_up_checkpoint).await?;
+        }
+        Ok(())
     }
 
     /// Enables Class C behavior. Note that Class C downlinks are not possible until a confirmed
@@ -316,6 +421,11 @@ where
                     &mut self.radio_buffer,
                 );
 
+                // 1.0.4: the incremented DevNonce must be durable before the request goes
+                // on the air, or a reset after transmit would reuse it and the join server
+                // would reject the device from then on.
+                persist_identity(&self.mac, &mut self.store).await?;
+
                 // Transmit the join payload
                 let ms = self
                     .radio
@@ -325,7 +435,15 @@ where
 
                 // Receive join response within RX window
                 self.timer.reset();
-                Ok(self.rx_downlink(&Frame::Join, ms, &rx_windows).await?.into())
+                let response = self.rx_downlink(&Frame::Join, ms, &rx_windows).await?;
+                if S::PERSISTENT && matches!(response, mac::Response::JoinSuccess) {
+                    // Advanced JoinNonce + epoch, then the fresh session (FCnt = 0) with
+                    // its first wear-leveling checkpoint.
+                    persist_identity(&self.mac, &mut self.store).await?;
+                    self.fcnt_up_checkpoint = self.checkpoint_margin;
+                    persist_session(&self.mac, &mut self.store, self.fcnt_up_checkpoint).await?;
+                }
+                Ok(response.into())
             }
             JoinMode::ABP { nwkskey, appskey, devaddr } => {
                 self.mac.join_abp(*nwkskey, *appskey, *devaddr);
@@ -351,11 +469,17 @@ where
         confirmed: bool,
     ) -> Result<SendResponse, Error<R::PhyError>> {
         // Prepare transmission buffer
-        let (tx_config, rx_windows, _fcnt_up) = self.mac.send::<G, N>(
+        let (tx_config, rx_windows, fcnt_up) = self.mac.send::<G, N>(
             &mut self.rng,
             &mut self.radio_buffer,
             &SendData { data, fport, confirmed },
         )?;
+        // The persisted checkpoint must stay strictly ahead of every counter that goes on
+        // the air; a reboot resumes from the checkpoint, so this guarantees no reuse.
+        if S::PERSISTENT && fcnt_up >= self.fcnt_up_checkpoint {
+            self.fcnt_up_checkpoint = fcnt_up + self.checkpoint_margin;
+            persist_session(&self.mac, &mut self.store, self.fcnt_up_checkpoint).await?;
+        }
         // Transmit our data packet
         let ms = self
             .radio
@@ -365,7 +489,14 @@ where
 
         // Wait for received data within window
         self.timer.reset();
-        Ok(self.rx_downlink(&Frame::Data, ms, &rx_windows).await?.into())
+        let response = self.rx_downlink(&Frame::Data, ms, &rx_windows).await?;
+        if S::PERSISTENT && matches!(response, mac::Response::DownlinkReceived(_)) {
+            // FCntDown advanced and MAC state may have changed; both are replay/config
+            // floors that must survive reboot. Persisted at its exact value (downlinks
+            // are rare; the dedup in save skips no-op writes).
+            persist_session(&self.mac, &mut self.store, self.fcnt_up_checkpoint).await?;
+        }
+        Ok(response.into())
     }
 
     /// Take the downlink data from the device. This is typically called after a
@@ -477,6 +608,9 @@ where
                         &mut self.mac,
                         &mut self.radio,
                         &mut self.rng,
+                        &mut self.store,
+                        &mut self.fcnt_up_checkpoint,
+                        self.checkpoint_margin,
                         mac_response,
                         Some(rx_config),
                     )
@@ -554,11 +688,15 @@ where
 
     /// Helper function to handle MAC responses and perform common actions
     #[allow(unused_variables)]
+    #[allow(clippy::too_many_arguments)]
     async fn handle_mac_response(
         radio_buffer: &mut RadioBuffer<N>,
         mac: &mut Mac,
         radio: &mut R,
         rng: &mut G,
+        store: &mut S,
+        fcnt_up_checkpoint: &mut u32,
+        checkpoint_margin: u32,
         response: mac::Response,
         rx_config: Option<RxConfig>,
     ) -> Result<Option<mac::Response>, Error<R::PhyError>> {
@@ -572,16 +710,24 @@ where
             }
             #[cfg(feature = "certification")]
             mac::Response::UplinkPrepared => {
-                let (tx_config, _fcnt_up) =
+                let (tx_config, fcnt_up) =
                     mac.certification_setup_send::<G, N>(rng, radio_buffer)?;
+                if S::PERSISTENT && fcnt_up >= *fcnt_up_checkpoint {
+                    *fcnt_up_checkpoint = fcnt_up + checkpoint_margin;
+                    persist_session(mac, store, *fcnt_up_checkpoint).await?;
+                }
                 radio.tx(tx_config, radio_buffer.as_ref_for_read()).await.map_err(Error::Radio)?;
                 Ok(Some(mac.rx2_complete()))
             }
             #[cfg(feature = "multicast")]
             mac::Response::Multicast(mut response) => {
                 if response.is_transmit_request() {
-                    let (tx_config, _fcnt_up) =
+                    let (tx_config, fcnt_up) =
                         mac.multicast_setup_send::<G, N>(rng, radio_buffer)?;
+                    if S::PERSISTENT && fcnt_up >= *fcnt_up_checkpoint {
+                        *fcnt_up_checkpoint = fcnt_up + checkpoint_margin;
+                        persist_session(mac, store, *fcnt_up_checkpoint).await?;
+                    }
                     radio
                         .tx(tx_config, radio_buffer.as_ref_for_read())
                         .await
@@ -623,6 +769,9 @@ where
                         &mut self.mac,
                         &mut self.radio,
                         &mut self.rng,
+                        &mut self.store,
+                        &mut self.fcnt_up_checkpoint,
+                        self.checkpoint_margin,
                         mac_response,
                         None,
                     )
@@ -654,15 +803,67 @@ where
                 &mut self.mac,
                 &mut self.radio,
                 &mut self.rng,
+                &mut self.store,
+                &mut self.fcnt_up_checkpoint,
+                self.checkpoint_margin,
                 mac_response,
                 Some(rx_config),
             )
             .await?
             {
+                if S::PERSISTENT && matches!(response, mac::Response::DownlinkReceived(_)) {
+                    // Class C downlink outside a send cycle still advances FCntDown.
+                    persist_session(&self.mac, &mut self.store, self.fcnt_up_checkpoint).await?;
+                }
                 return Ok(response.into());
             }
         }
     }
+}
+
+/// Save a blob unless the store already holds identical bytes, sparing flash wear on
+/// commit points that turn out to be no-ops (e.g. a downlink that changed no MAC state).
+async fn save_dedup<S: NonVolatileStore>(
+    store: &mut S,
+    region: NvmRegion,
+    blob: &[u8],
+) -> Result<(), S::Error> {
+    let mut current = [0u8; MAX_BLOB_LEN];
+    if let Ok(Some(n)) = store.load(region, &mut current).await {
+        if current[..n] == *blob {
+            return Ok(());
+        }
+    }
+    store.save(region, blob).await
+}
+
+async fn persist_identity<S: NonVolatileStore, RE>(
+    mac: &Mac,
+    store: &mut S,
+) -> Result<(), Error<RE>> {
+    if S::PERSISTENT {
+        if let Some(identity) = mac.identity() {
+            let mut buf = [0u8; MAX_BLOB_LEN];
+            let len = identity.encode(&mut buf);
+            save_dedup(store, NvmRegion::Identity, &buf[..len]).await.map_err(|_| Error::Nvm)?;
+        }
+    }
+    Ok(())
+}
+
+async fn persist_session<S: NonVolatileStore, RE>(
+    mac: &Mac,
+    store: &mut S,
+    fcnt_up_checkpoint: u32,
+) -> Result<(), Error<RE>> {
+    if S::PERSISTENT {
+        if let Some(session) = mac.snapshot_session(fcnt_up_checkpoint) {
+            let mut buf = [0u8; MAX_BLOB_LEN];
+            let len = session.encode(&mut buf);
+            save_dedup(store, NvmRegion::Session, &buf[..len]).await.map_err(|_| Error::Nvm)?;
+        }
+    }
+    Ok(())
 }
 
 /// Allows to fine-tune the beginning and end of the receive windows for a specific board and runtime.

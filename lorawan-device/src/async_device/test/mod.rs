@@ -22,6 +22,8 @@ mod certification;
 
 mod maccommands;
 
+mod nvm;
+
 #[cfg(feature = "class-c")]
 mod class_c;
 
