@@ -138,9 +138,11 @@ fn join_accept<const T: usize, const NONCE: u8, const EXPECT_DEV_NONCE: u16>(
     let len = finished.len();
 
     let mut copy = finished.to_vec();
-    let decrypt =
-        DecryptedJoinAcceptPayload::check_mic_and_decrypt_in_place(copy.as_mut_slice(), &get_crypto())
-            .expect("could not parse own join accept");
+    let decrypt = DecryptedJoinAcceptPayload::check_mic_and_decrypt_in_place(
+        copy.as_mut_slice(),
+        &get_crypto(),
+    )
+    .expect("could not parse own join accept");
     let session = Session::derive_new(
         &decrypt,
         dev_nonce,

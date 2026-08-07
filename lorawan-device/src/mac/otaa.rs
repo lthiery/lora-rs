@@ -38,8 +38,7 @@ impl Otaa {
         dev_nonce: Option<u16>,
         buf: &mut RadioBuffer<N>,
     ) -> u16 {
-        self.dev_nonce =
-            DevNonce::from_value(dev_nonce.unwrap_or_else(|| rng.next_u32() as u16));
+        self.dev_nonce = DevNonce::from_value(dev_nonce.unwrap_or_else(|| rng.next_u32() as u16));
         buf.clear();
         let request = JoinRequest {
             join_eui: self.network_credentials.appeui.into(),
