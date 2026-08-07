@@ -120,6 +120,13 @@ impl Session {
         self.fcnt_down
     }
 
+    /// Reinstate the downlink counter of a persisted session being restored from
+    /// non-volatile storage. Not for use on a live session: the counter must only
+    /// advance through `handle_rx`, which enforces the replay window.
+    pub(crate) fn restore_fcnt_down(&mut self, fcnt_down: Option<u32>) {
+        self.fcnt_down = fcnt_down;
+    }
+
     pub fn get_session_keys(&self) -> Option<SessionKeys> {
         Some(SessionKeys { nwkskey: self.nwkskey, appskey: self.appskey, devaddr: self.devaddr })
     }

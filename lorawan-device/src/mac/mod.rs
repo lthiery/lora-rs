@@ -3,6 +3,7 @@
 //! decrypting from send and receive buffers.
 
 use crate::{
+    nvm::{PersistentIdentity, PersistentSession},
     radio::{self, RadioBuffer, RfConfig, RxConfig, RxMode},
     region, AppSKey, Downlink, NwkSKey,
 };
@@ -89,6 +90,10 @@ pub(crate) struct Mac {
     pub region: region::Configuration,
     board_eirp: BoardEirp,
     state: State,
+    /// Durable 1.0.4 join anti-replay counters. `None` keeps the 1.0.2 behavior
+    /// (random DevNonce, no JoinNonce check); set only when the device has a
+    /// persistent store to commit them to.
+    identity: Option<PersistentIdentity>,
     #[cfg(feature = "certification")]
     certification: certification::Certification,
     #[cfg(feature = "multicast")]
@@ -130,6 +135,7 @@ impl Mac {
             board_eirp: BoardEirp { max_power, antenna_gain },
             region,
             state: State::Unjoined,
+            identity: None,
             configuration: Configuration {
                 data_rate,
                 rx1_delay: region::constants::RECEIVE_DELAY1,
@@ -156,7 +162,15 @@ impl Mac {
         buf: &mut RadioBuffer<N>,
     ) -> (radio::TxConfig, RxWindows, u16) {
         let mut otaa = otaa::Otaa::new(credentials);
-        let dev_nonce = otaa.prepare_buffer::<RNG, N>(rng, buf);
+        // 1.0.4 (persistent identity): DevNonce comes from the monotonic counter and the
+        // increment must be committed to the store before the request goes on the air;
+        // the device layer persists between this call and the actual transmit.
+        let next_dev_nonce = self.identity.as_mut().map(|id| {
+            let n = id.dev_nonce;
+            id.dev_nonce = id.dev_nonce.saturating_add(1);
+            n
+        });
+        let dev_nonce = otaa.prepare_buffer::<RNG, N>(rng, next_dev_nonce, buf);
         self.state = State::Otaa(otaa);
         let (mut tx_config, tx_channel) =
             self.region.create_tx_config(rng, self.configuration.data_rate, &Frame::Join);
@@ -282,9 +296,12 @@ impl Mac {
                 false,
             ),
             State::Otaa(ref mut otaa) => {
-                if let Some(session) =
-                    otaa.handle_rx::<N>(&mut self.region, &mut self.configuration, buf)
-                {
+                if let Some(session) = otaa.handle_rx::<N>(
+                    &mut self.region,
+                    &mut self.configuration,
+                    self.identity.as_mut(),
+                    buf,
+                ) {
                     self.state = State::Joined(session);
                     Response::JoinSuccess
                 } else {
@@ -359,6 +376,54 @@ impl Mac {
             State::Otaa(_) => None,
             State::Unjoined => None,
         }
+    }
+
+    pub(crate) fn set_identity(&mut self, identity: PersistentIdentity) {
+        self.identity = Some(identity);
+    }
+
+    pub(crate) fn identity(&self) -> Option<&PersistentIdentity> {
+        self.identity.as_ref()
+    }
+
+    /// Snapshot the active session and negotiated MAC state for persistence.
+    /// `fcnt_up_checkpoint` is chosen by the device layer (wear-leveling policy).
+    pub(crate) fn snapshot_session(&self, fcnt_up_checkpoint: u32) -> Option<PersistentSession> {
+        let session = self.get_session()?;
+        Some(PersistentSession {
+            nwkskey: session.nwkskey,
+            appskey: session.appskey,
+            devaddr: session.devaddr,
+            fcnt_up_checkpoint,
+            fcnt_down: session.fcnt_down(),
+            join_epoch: self.identity.as_ref().map_or(0, |id| id.join_epoch),
+            data_rate: self.configuration.data_rate,
+            rx1_delay: self.configuration.rx1_delay,
+            rx1_dr_offset: self.configuration.rx1_dr_offset,
+            rx2_data_rate: self.configuration.rx2_data_rate,
+            rx2_frequency: self.configuration.rx2_frequency,
+            tx_power: self.configuration.tx_power,
+        })
+    }
+
+    /// Reconstruct a joined state from a persisted session. `fcnt_up` resumes from the
+    /// checkpoint, which is always ahead of any counter that went on the air, so up to
+    /// `MARGIN` counter values are skipped instead of ever reusing one.
+    pub(crate) fn restore_session(&mut self, ps: &PersistentSession) {
+        let mut session = Session::new(ps.nwkskey, ps.appskey, ps.devaddr);
+        session.fcnt_up = ps.fcnt_up_checkpoint;
+        session.restore_fcnt_down(ps.fcnt_down);
+        // Only adopt a persisted data rate the current region actually supports; a
+        // firmware/region change between boots must not leave us on a garbage DR.
+        if self.region.get_datarate(ps.data_rate as u8).is_some() {
+            self.configuration.data_rate = ps.data_rate;
+        }
+        self.configuration.rx1_delay = ps.rx1_delay;
+        self.configuration.rx1_dr_offset = ps.rx1_dr_offset;
+        self.configuration.rx2_data_rate = ps.rx2_data_rate;
+        self.configuration.rx2_frequency = ps.rx2_frequency;
+        self.configuration.tx_power = ps.tx_power;
+        self.state = State::Joined(session);
     }
 
     /// Build the RfConfig for a window given its frequency and datarate, handling possibly
