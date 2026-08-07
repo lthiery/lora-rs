@@ -55,5 +55,9 @@ harness = false
 name = "join"
 harness = false
 
+[[test]]
+name = "nvm"
+harness = false
+
 [profile.release]
 debug = 2
