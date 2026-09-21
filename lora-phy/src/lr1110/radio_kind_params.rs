@@ -333,6 +333,7 @@ pub fn coding_rate_value(coding_rate: CodingRate) -> Result<u8, RadioError> {
         CodingRate::_4_6 => Ok(0x02),
         CodingRate::_4_7 => Ok(0x03),
         CodingRate::_4_8 => Ok(0x04),
+        _ => Err(RadioError::UnavailableCodingRate)
     }
 }
 
