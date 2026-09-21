@@ -15,8 +15,12 @@ pub enum Bandwidth {
     _41KHz,
     _62KHz,
     _125KHz,
+    _200KHz,
     _250KHz,
+    _400KHz,
     _500KHz,
+    _800KHz,
+    _1600KHz,
 }
 
 impl Bandwidth {
@@ -30,8 +34,12 @@ impl Bandwidth {
             Bandwidth::_41KHz => 41670u32,
             Bandwidth::_62KHz => 62500u32,
             Bandwidth::_125KHz => 125000u32,
+            Bandwidth::_200KHz => 200000u32,
             Bandwidth::_250KHz => 250000u32,
+            Bandwidth::_400KHz => 400000u32,
             Bandwidth::_500KHz => 500000u32,
+            Bandwidth::_800KHz => 800000u32,
+            Bandwidth::_1600KHz => 1600000u32,
         }
     }
 }

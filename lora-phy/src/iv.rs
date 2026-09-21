@@ -260,7 +260,7 @@ where
         self.busy.wait_for_low().await.map_err(|_| Busy)
     }
     async fn await_irq(&mut self) -> Result<(), RadioError> {
-        self.irq.wait_for_high().await.map_err(|_| DIO1)?;
+        self.irq.wait_for_high().await.map_err(|_| Irq)?;
         Ok(())
     }
 

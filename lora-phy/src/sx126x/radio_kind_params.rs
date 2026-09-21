@@ -289,6 +289,7 @@ pub fn bandwidth_value(bandwidth: Bandwidth) -> Result<u8, RadioError> {
         Bandwidth::_125KHz => Ok(0x04),
         Bandwidth::_250KHz => Ok(0x05),
         Bandwidth::_500KHz => Ok(0x06),
+        _ => Err(RadioError::InvalidBandwidthForFrequency),
     }
 }
 
