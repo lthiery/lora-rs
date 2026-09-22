@@ -6,31 +6,7 @@ use embedded_hal_async::spi::SpiDevice;
 #[allow(async_fn_in_trait)]
 pub trait Sx128xVariant {
     type Data: Default;
-
-    async fn init_lora<SPI: SpiDevice<u8>, IV: InterfaceVariant>(
-        radio: &mut Sx128x<SPI, IV, Self>,
-        sync_word: u8,
-    ) -> Result<(), RadioError>
-    where
-        Self: Sized;
-
-    fn bandwidth_value(bw: Bandwidth) -> Result<u8, RadioError>;
-    //fn reg_txco() -> Register;
-    async fn set_tx_power<SPI: SpiDevice<u8>, IV: InterfaceVariant>(
-        radio: &mut Sx128x<SPI, IV, Self>,
-        p_out: i32,
-        tx_boost: bool,
-    ) -> Result<(), RadioError>
-    where
-        Self: Sized;
-    fn ramp_value(ramp_time: RampTime) -> u8;
-
-    async fn set_modulation_params<SPI: SpiDevice<u8>, IV: InterfaceVariant>(
-        radio: &mut Sx128x<SPI, IV, Self>,
-        mdltn_params: &ModulationParams,
-    ) -> Result<(), RadioError>
-    where
-        Self: Sized;
+    
     async fn set_packet_params<SPI: SpiDevice<u8>, IV: InterfaceVariant>(
         radio: &mut Sx128x<SPI, IV, Self>,
         pkt_params: &PacketParams,
@@ -68,6 +44,7 @@ impl LoRaMode {
     }
 }
 
+// TODO:
 // IRQ mapping for sx128x chips:
 // DIO0 - RxDone, TxDone, CadDone
 // DIO1 - RxTimeout, FhssChangeChannel, CadDetected
@@ -125,27 +102,57 @@ impl DioMapping1Dio3 {
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 pub enum IrqMask {
-    None = 0x00,
-    CADActivityDetected = 0x01,
-    FhssChangedChannel = 0x02,
-    CADDone = 0x04,
-    TxDone = 0x08,
-    HeaderValid = 0x10,
-    CRCError = 0x20,
-    RxDone = 0x40,
-    RxTimeout = 0x80,
-    All = 0xFF,
+    None = 0x0000,
+    TxDone = 0x0001,
+    RxDone = 0x0002,
+    SyncWordValid = 0x0004,
+    SyncWordError = 0x0008,
+    HeaderValid = 0x0010,
+    HeaderError = 0x0020,
+    CrcError = 0x0040,
+    RangingSlaveResponse = 0x0080,
+    RangingSlaveRequestDiscard = 0x0100,
+    RangingMasterResultValid = 0x0200,
+    RangingMasterTimeout = 0x0400,
+    RangingSlaveRequestValid = 0x0800,
+    CadDone = 0x1000,
+    CadDetected = 0x2000,
+    RxTxTimout = 0x4000,
+    PreambleDetectedOrAdvancedRangingDone = 0x8000,
+    All = 0xFFFF,
 }
 
 impl IrqMask {
-    pub fn value(self) -> u8 {
-        self as u8
+    pub fn value(self) -> u16 {
+        self as u16
     }
 
-    pub fn is_set_in(self, mask: u8) -> bool {
+    pub fn is_set_in(self, mask: u16) -> bool {
         self.value() & mask == self.value()
     }
 }
+
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
+#[allow(clippy::upper_case_acronyms)]
+pub enum StandbyConfig {
+    Rc = 0,
+    Xosc = 1,
+}
+
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
+#[allow(clippy::upper_case_acronyms)]
+pub enum PacketType {
+    Gfsk = 0,
+    LoRa = 1,
+    Ranging = 2,
+    Flrc = 3,
+    Ble = 4,
+}
+
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(dead_code)]
@@ -278,9 +285,6 @@ pub enum Register {
 
 #[allow(non_upper_case_globals)]
 impl Register {
-    pub fn addr(self) -> u16 {
-        self as u16
-    }
     pub fn addr1(self) -> u8 {
         ((self as u16 & 0xFF00) >> 8) as u8
     }
@@ -391,22 +395,14 @@ impl OpCode {
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
 pub enum RampTime {
-    Ramp3_4Ms = 0x00,
-    Ramp2Ms = 0x01,
-    Ramp1Ms = 0x02,
-    Ramp500Us = 0x03,
-    Ramp250Us = 0x04,
-    Ramp125Us = 0x05,
-    Ramp100Us = 0x06,
-    Ramp62Us = 0x07,
-    Ramp50Us = 0x08,
-    Ramp40Us = 0x09,
-    Ramp31Us = 0x0a,
-    Ramp25Us = 0x0b,
-    Ramp20Us = 0x0c,
-    Ramp15Us = 0x0d,
-    Ramp12Us = 0x0e,
-    Ramp10Us = 0x0f,
+    Ramp02Us = 0x00,
+    Ramp04Us = 0x20,
+    Ramp06Us = 0x40,
+    Ramp08Us = 0x60,
+    Ramp10Us = 0x80,
+    Ramp12Us = 0xA0,
+    Ramp16Us = 0xC0,
+    Ramp20Us = 0xE0,
 }
 
 impl RampTime {
@@ -516,21 +512,23 @@ pub fn spreading_factor_value(spreading_factor: SpreadingFactor) -> Result<u8, R
     }
 }
 
-#[allow(dead_code)]
-pub fn coding_rate_value(coding_rate: CodingRate) -> Result<u8, RadioError> {
-    match coding_rate {
+
+pub fn bandwidth_value(bw: Bandwidth) -> Result<u8, RadioError> {
+    match bw {
+        Bandwidth::_200KHz => Ok(0x34),
+        Bandwidth::_400KHz => Ok(0x26),
+        Bandwidth::_800KHz => Ok(0x18),
+        Bandwidth::_1600KHz => Ok(0x0A),
+        _ => Err(RadioError::InvalidBandwidthForFrequency),
+    }
+}
+
+pub fn coding_rate_value(cr: CodingRate) -> Result<u8, RadioError> {
+    match cr {
         CodingRate::_4_5 => Ok(0x01),
         CodingRate::_4_6 => Ok(0x02),
         CodingRate::_4_7 => Ok(0x03),
         CodingRate::_4_8 => Ok(0x04),
-    }
-}
-
-pub fn coding_rate_denominator_value(coding_rate: CodingRate) -> Result<u8, RadioError> {
-    match coding_rate {
-        CodingRate::_4_5 => Ok(0x05),
-        CodingRate::_4_6 => Ok(0x06),
-        CodingRate::_4_7 => Ok(0x07),
-        CodingRate::_4_8 => Ok(0x08),
+        _  => Err(RadioError::UnavailableCodingRate),            
     }
 }
