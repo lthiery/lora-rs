@@ -95,10 +95,24 @@ where
     }
 
     async fn read_register(&mut self, register: Register) -> Result<u8, RadioError> {
-        let write_buffer = [OpCode::WriteRegister as u8, register.addr1(), register.addr2()];
-        let mut read_buffer = [0x00u8];
+        // After the register, a NOP byte is needed.
+        debug!("sx128x::read_register");
+        let write_buffer = [OpCode::ReadRegister as u8, register.addr1(), register.addr2(), 0x00];
+        let mut read_buffer = [0x00u8; 1];
         self.intf.read(&write_buffer, &mut read_buffer).await?;
         Ok(read_buffer[0])
+    }
+
+    async fn read_register_into_buffer(
+        &mut self,
+        register: Register,
+        read_buffer: &mut [u8],
+    ) -> Result<(), RadioError> {
+        // After the register, a NOP byte is needed.
+        debug!("sx128x::read_register");
+        let write_buffer = [OpCode::ReadRegister as u8, register.addr1(), register.addr2(), 0x00];
+        self.intf.read(&write_buffer, read_buffer).await?;
+        Ok(())
     }
 
     async fn read_buffer(&mut self, register: Register, buf: &mut [u8]) -> Result<(), RadioError> {
@@ -178,8 +192,8 @@ where
     const MAX_SINGLE_RX_SYMBOLS: u16 = SX128X_MAX_LORA_SYMB_NUM_TIMEOUT;
 
     async fn init_lora(&mut self, sync_word: u16) -> Result<(), RadioError> {
-        let firmware_version = self.read_register(Register::FirmwareVersions).await?;
-        debug!("Detected sx128x firmware version v{}", firmware_version);
+        let rx_gain = self.read_register(Register::RxGain).await?;
+        debug!("Detected sx128x rx_gain {:02X} (should be 0x25)", rx_gain);
         self.set_packet_type(PacketType::LoRa).await?;
         self.set_lora_sync_word(sync_word).await?;
         self.set_tx_rx_buffer_base_address(0, 0).await?;
@@ -250,7 +264,14 @@ where
     }
 
     async fn ensure_ready(&mut self, _mode: RadioMode) -> Result<(), RadioError> {
-        // TODO
+        debug!("sx128x::ensure_ready");
+        match self.read_register(Register::RxGain).await {
+            Ok(rx_gain) => debug!("Detected sx128x rx_gain {:02X} (should be 0x25)", rx_gain),
+            Err(error) => {
+                debug!("Can't ensure ready: {:?}", error)
+            }
+        }
+
         Ok(())
     }
 
@@ -258,14 +279,21 @@ where
         self.intf.iv.disable_rf_switch().await?;
         let buf = [
             OpCode::SetStandby as u8,
-            0x01,
             if self.config.tcxo_used {
                 StandbyConfig::Xosc
             } else {
                 StandbyConfig::Rc
             } as u8,
         ];
-        self.intf.write(&buf, true).await
+        let mut read_buf = [0; 0];
+        // TODO: evaluate status as in RadioLib
+        let status = self.intf.read_with_status(&buf, &mut read_buf).await?;
+        info!("status: {:02X}", status);
+        let mut write_buffer = [0; 16];
+        self.read_register_into_buffer(Register::VersionString, &mut write_buffer)
+            .await?;
+        debug!("firmware versions: {:?}", write_buffer);
+        Ok(())
     }
 
     async fn set_sleep(&mut self, _warm_start_if_possible: bool, _delay: &mut impl DelayNs) -> Result<(), RadioError> {
@@ -487,51 +515,54 @@ where
         radio_mode: RadioMode,
         cad_activity_detected: Option<&mut bool>,
     ) -> Result<Option<IrqState>, RadioError> {
-        // let irq_flags = self.read_register(Register::RegIrqFlags).await?;
-        // match radio_mode {
-        //     RadioMode::Transmit => {
-        //         if (irq_flags & IrqMask::TxDone.value()) == IrqMask::TxDone.value() {
-        //             debug!("TxDone in radio mode {}", radio_mode);
-        //             return Ok(Some(IrqState::Done));
-        //         }
-        //     }
-        //     RadioMode::Receive(RxMode::Continuous | RxMode::Single(_) | RxMode::SingleMs(_)) => {
-        //         if (irq_flags & IrqMask::RxDone.value()) == IrqMask::RxDone.value() {
-        //             debug!("RxDone in radio mode {}", radio_mode);
-        //             return Ok(Some(IrqState::Done));
-        //         }
-        //         if (irq_flags & IrqMask::RxTimeout.value()) == IrqMask::RxTimeout.value() {
-        //             debug!("RxTimeout in radio mode {}", radio_mode);
-        //             return Err(RadioError::ReceiveTimeout);
-        //         }
-        //         if IrqMask::HeaderValid.is_set_in(irq_flags) {
-        //             debug!("HeaderValid in radio mode {}", radio_mode);
-        //             return Ok(Some(IrqState::PreambleReceived));
-        //         }
-        //     }
-        //     RadioMode::ChannelActivityDetection => {
-        //         if (irq_flags & IrqMask::CADDone.value()) == IrqMask::CADDone.value() {
-        //             debug!("CADDone in radio mode {}", radio_mode);
-        //             // TODO: don't like how we mutate the cad_activity_detected parameter
-        //             if let Some(cad_activity_detected) = cad_activity_detected {
-        //                 // Check if the CAD (Channel Activity Detection) Activity Detected flag is set in irq_flags and then update the reference
-        //                 *(cad_activity_detected) =
-        //                     (irq_flags & IrqMask::CADActivityDetected.value()) == IrqMask::CADActivityDetected.value();
-        //             }
+        // Needs a NOP, see 11.9.2
+        let write_buffer = [OpCode::GetIrqStatus as u8, 0];
+        let mut read_buffer = [0; 2];
+        self.intf.read(&write_buffer, &mut read_buffer).await?;
+        let irq_flags = u16::from_be_bytes(read_buffer);
+        match radio_mode {
+            RadioMode::Transmit => {
+                if (irq_flags & IrqMask::TxDone.value()) == IrqMask::TxDone.value() {
+                    debug!("TxDone in radio mode {}", radio_mode);
+                    return Ok(Some(IrqState::Done));
+                }
+            } // RadioMode::Receive(RxMode::Continuous | RxMode::Single(_) | RxMode::SingleMs(_)) => {
+            //     if (irq_flags & IrqMask::RxDone.value()) == IrqMask::RxDone.value() {
+            //         debug!("RxDone in radio mode {}", radio_mode);
+            //         return Ok(Some(IrqState::Done));
+            //     }
+            //     if (irq_flags & IrqMask::RxTimeout.value()) == IrqMask::RxTimeout.value() {
+            //         debug!("RxTimeout in radio mode {}", radio_mode);
+            //         return Err(RadioError::ReceiveTimeout);
+            //     }
+            //     if IrqMask::HeaderValid.is_set_in(irq_flags) {
+            //         debug!("HeaderValid in radio mode {}", radio_mode);
+            //         return Ok(Some(IrqState::PreambleReceived));
+            //     }
+            // }
+            // RadioMode::ChannelActivityDetection => {
+            //     if (irq_flags & IrqMask::CADDone.value()) == IrqMask::CADDone.value() {
+            //         debug!("CADDone in radio mode {}", radio_mode);
+            //         // TODO: don't like how we mutate the cad_activity_detected parameter
+            //         if let Some(cad_activity_detected) = cad_activity_detected {
+            //             // Check if the CAD (Channel Activity Detection) Activity Detected flag is set in irq_flags and then update the reference
+            //             *(cad_activity_detected) =
+            //                 (irq_flags & IrqMask::CADActivityDetected.value()) == IrqMask::CADActivityDetected.value();
+            //         }
 
-        //             return Ok(Some(IrqState::Done));
-        //         }
-        //     }
-        //     RadioMode::Sleep | RadioMode::Standby | RadioMode::Listen => {
-        //         warn!("IRQ during sleep/standby/listen?");
-        //     }
-        //     RadioMode::FrequencySynthesis => todo!(),
-        //     RadioMode::Receive(RxMode::DutyCycle(_)) => todo!(),
-        // }
+            //         return Ok(Some(IrqState::Done));
+            //     }
+            // }
+            // RadioMode::Sleep | RadioMode::Standby | RadioMode::Listen => {
+            //     warn!("IRQ during sleep/standby/listen?");
+            // }
+            // RadioMode::FrequencySynthesis => todo!(),
+            // RadioMode::Receive(RxMode::DutyCycle(_)) => todo!(),
+            e @ _ => warn!("Unknown radio mode: {:?}!", e),
+        }
 
-        // // If no specific IRQ condition is met, return None
-        // Ok(None)
-        todo!();
+        // If no specific IRQ condition is met, return None
+        Ok(None)
     }
 
     async fn clear_irq_status(&mut self) -> Result<(), RadioError> {

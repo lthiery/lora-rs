@@ -6,7 +6,7 @@ use embedded_hal_async::spi::SpiDevice;
 #[allow(async_fn_in_trait)]
 pub trait Sx128xVariant {
     type Data: Default;
-    
+
     async fn set_packet_params<SPI: SpiDevice<u8>, IV: InterfaceVariant>(
         radio: &mut Sx128x<SPI, IV, Self>,
         pkt_params: &PacketParams,
@@ -132,7 +132,6 @@ impl IrqMask {
     }
 }
 
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(dead_code)]
 #[allow(clippy::upper_case_acronyms)]
@@ -140,7 +139,6 @@ pub enum StandbyConfig {
     Rc = 0,
     Xosc = 1,
 }
-
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(dead_code)]
@@ -152,7 +150,6 @@ pub enum PacketType {
     Flrc = 3,
     Ble = 4,
 }
-
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(dead_code)]
@@ -281,6 +278,8 @@ pub enum Register {
     SyncAddress3Byte1 = 0x09DB,
     /// Sync Word 3 (Byte 0)
     SyncAddress3Byte0 = 0x09DC,
+    /// VersionString, not found in datasheet!
+    VersionString = 0x1F0,
 }
 
 #[allow(non_upper_case_globals)]
@@ -512,7 +511,6 @@ pub fn spreading_factor_value(spreading_factor: SpreadingFactor) -> Result<u8, R
     }
 }
 
-
 pub fn bandwidth_value(bw: Bandwidth) -> Result<u8, RadioError> {
     match bw {
         Bandwidth::_200KHz => Ok(0x34),
@@ -529,6 +527,6 @@ pub fn coding_rate_value(cr: CodingRate) -> Result<u8, RadioError> {
         CodingRate::_4_6 => Ok(0x02),
         CodingRate::_4_7 => Ok(0x03),
         CodingRate::_4_8 => Ok(0x04),
-        _  => Err(RadioError::UnavailableCodingRate),            
+        _ => Err(RadioError::UnavailableCodingRate),
     }
 }
