@@ -192,8 +192,14 @@ where
     const MAX_SINGLE_RX_SYMBOLS: u16 = SX128X_MAX_LORA_SYMB_NUM_TIMEOUT;
 
     async fn init_lora(&mut self, sync_word: u16) -> Result<(), RadioError> {
-        let rx_gain = self.read_register(Register::RxGain).await?;
-        debug!("Detected sx128x rx_gain {:02X} (should be 0x25)", rx_gain);
+        let mut write_buffer = [0; 16];
+        self.read_register_into_buffer(Register::VersionString, &mut write_buffer)
+            .await?;
+        debug!("firmware versions: {:?}", write_buffer);
+        if b"SX1280" != &write_buffer[0..6] {
+            // TODO: maybe introduce explicit error code
+            return Err(RadioError::InvalidConfiguration);
+        }
         self.set_packet_type(PacketType::LoRa).await?;
         self.set_lora_sync_word(sync_word).await?;
         self.set_tx_rx_buffer_base_address(0, 0).await?;
@@ -227,11 +233,31 @@ where
     }
 
     async fn set_modulation_params(&mut self, mdltn_params: &ModulationParams) -> Result<(), RadioError> {
+        info!("set_modulation_params: {:02X}", OpCode::SetModulationParams as u8);
         let mod_param_1 = spreading_factor_value(mdltn_params.spreading_factor)?;
         let mod_param_2 = bandwidth_value(mdltn_params.bandwidth)?;
         let mod_param_3 = coding_rate_value(mdltn_params.coding_rate)?;
         let buffer = [OpCode::SetModulationParams as u8, mod_param_1, mod_param_2, mod_param_3];
-        self.intf.write(&buffer, true).await
+        self.intf.write(&buffer, true).await?;
+        // section 14.4.1, before table 14-48
+        self.write_register(
+            Register::SfAdditionalConfiguration,
+            match mdltn_params.spreading_factor {
+                SpreadingFactor::_5 | SpreadingFactor::_6 => 0x1E,
+                SpreadingFactor::_7 | SpreadingFactor::_8 => 0x37,
+                SpreadingFactor::_9 | SpreadingFactor::_10 | SpreadingFactor::_11 | SpreadingFactor::_12 => 0x32,
+            },
+        )
+        .await?;
+        self.write_register(Register::FrequencyErrorCorrection, 0x01).await?;
+        // These two follow the RadioLib
+        let buffer = [OpCode::SetCadParams as u8, CadSymbolNum::_8 as u8];
+        self.intf.write(&buffer, true).await?;
+        // 14.7.2: Assumes we don't have an extra inductor, might need confuration.
+        let buffer = [OpCode::SetRegulatorMode as u8, 0x00];
+        self.intf.write(&buffer, true).await?;
+        // TODO: limit payload lenth, after table 14-49.
+        Ok(())
     }
 
     fn create_packet_params(
@@ -265,18 +291,15 @@ where
 
     async fn ensure_ready(&mut self, _mode: RadioMode) -> Result<(), RadioError> {
         debug!("sx128x::ensure_ready");
-        match self.read_register(Register::RxGain).await {
-            Ok(rx_gain) => debug!("Detected sx128x rx_gain {:02X} (should be 0x25)", rx_gain),
-            Err(error) => {
-                debug!("Can't ensure ready: {:?}", error)
-            }
-        }
-
+        self.set_standby().await?;
         Ok(())
     }
 
     async fn set_standby(&mut self) -> Result<(), RadioError> {
+        debug!("sx128x::set_standby");
         self.intf.iv.disable_rf_switch().await?;
+        // send a NOP to wake up
+        self.intf.write(&[0], true).await?;
         let buf = [
             OpCode::SetStandby as u8,
             if self.config.tcxo_used {
@@ -289,10 +312,6 @@ where
         // TODO: evaluate status as in RadioLib
         let status = self.intf.read_with_status(&buf, &mut read_buf).await?;
         info!("status: {:02X}", status);
-        let mut write_buffer = [0; 16];
-        self.read_register_into_buffer(Register::VersionString, &mut write_buffer)
-            .await?;
-        debug!("firmware versions: {:?}", write_buffer);
         Ok(())
     }
 
@@ -310,6 +329,7 @@ where
         tx_base_addr: usize,
         rx_base_addr: usize,
     ) -> Result<(), RadioError> {
+        debug!("sx128x::set_tx_rx_buffer_base_address");
         if tx_base_addr > 255 || rx_base_addr > 255 {
             return Err(RadioError::InvalidBaseAddress(tx_base_addr, rx_base_addr));
         }
@@ -331,15 +351,16 @@ where
         _mdltn_params: Option<&ModulationParams>,
         is_tx_prep: bool,
     ) -> Result<(), RadioError> {
-        debug!("tx power = {}", p_out);
-        // 4us, as in ELRS
-        let ramp_time = RampTime::Ramp04Us;
+        debug!("sx128x::set_tx_power_and_ramp_time:tx power = {}", p_out);
+        // 10us, as in Radiolib
+        let ramp_time = RampTime::Ramp10Us;
         let power = p_out + 18;
         let write_buffer = [OpCode::SetTxParams as u8, power as u8, ramp_time as u8];
         self.intf.write(&write_buffer, true).await
     }
 
     async fn set_packet_params(&mut self, pkt_params: &PacketParams) -> Result<(), RadioError> {
+        debug!("sx128x::set_packet_params");
         let buffer = [
             OpCode::SetPacketParams as u8,
             self.preamble_length_value(pkt_params.preamble_length)?,
@@ -566,6 +587,7 @@ where
     }
 
     async fn clear_irq_status(&mut self) -> Result<(), RadioError> {
+        debug!("sx128x::clear_irq_status");
         let buffer = [OpCode::ClrIrqStatus as u8, 0xff, 0xff];
         self.intf.write(&buffer, true).await
     }

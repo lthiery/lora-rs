@@ -154,6 +154,17 @@ pub enum PacketType {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(dead_code)]
 #[allow(clippy::upper_case_acronyms)]
+pub enum CadSymbolNum {
+    _1 = 0x00,
+    _2 = 0x20,
+    _4 = 0x40,
+    _8 = 0x60,
+    _16 = 0x80,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)]
+#[allow(clippy::upper_case_acronyms)]
 pub enum Register {
     // Sheet 1 of 3 (Table 13-1: List of Registers)
     /// Firmware versions 0xB7A9 and 0xB5A9 can be read from register 0x0153
@@ -211,9 +222,9 @@ pub enum Register {
     /// Peak-to-noise ratio decision threshold for the CAD
     CadDetPeak = 0x0942,
     /// LoRa sync word value MSB (0x0944)
-    LoRaSyncWord1 = 0x0944,
+    LoRaSyncWord0 = 0x0944,
     /// LoRa sync word value LSB (0x0945)
-    LoRaSyncWord0 = 0x0945,
+    LoRaSyncWord1 = 0x0945,
     /// CRC present in LoRa incoming packet (bit 4)
     HeaderCrc = 0x0954,
     /// Coding Rate in LoRa incoming packet (bits 4:6)
@@ -501,13 +512,13 @@ impl OcpTrim {
 pub fn spreading_factor_value(spreading_factor: SpreadingFactor) -> Result<u8, RadioError> {
     match spreading_factor {
         SpreadingFactor::_5 => Err(RadioError::UnavailableSpreadingFactor),
-        SpreadingFactor::_6 => Ok(0x06),
-        SpreadingFactor::_7 => Ok(0x07),
-        SpreadingFactor::_8 => Ok(0x08),
-        SpreadingFactor::_9 => Ok(0x09),
-        SpreadingFactor::_10 => Ok(0x0A),
-        SpreadingFactor::_11 => Ok(0x0B),
-        SpreadingFactor::_12 => Ok(0x0C),
+        SpreadingFactor::_6 => Ok(0x60),
+        SpreadingFactor::_7 => Ok(0x70),
+        SpreadingFactor::_8 => Ok(0x80),
+        SpreadingFactor::_9 => Ok(0x90),
+        SpreadingFactor::_10 => Ok(0xA0),
+        SpreadingFactor::_11 => Ok(0xB0),
+        SpreadingFactor::_12 => Ok(0xC0),
     }
 }
 
