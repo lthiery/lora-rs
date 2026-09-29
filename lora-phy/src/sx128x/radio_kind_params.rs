@@ -68,6 +68,14 @@ impl DioMapping1Dio0 {
     }
 }
 
+#[allow(dead_code, non_camel_case_types)]
+pub enum PeriodBase {
+    _15_625us = 0x00,
+    _62_5us = 0x01,
+    _1ms = 0x02,
+    _4_ms = 0x03,
+}
+
 #[allow(dead_code)]
 pub enum DioMapping1Dio1 {
     RxTimeOut = 0b00 << 4,
@@ -117,7 +125,7 @@ pub enum IrqMask {
     RangingSlaveRequestValid = 0x0800,
     CadDone = 0x1000,
     CadDetected = 0x2000,
-    RxTxTimout = 0x4000,
+    RxTxTimeout = 0x4000,
     PreambleDetectedOrAdvancedRangingDone = 0x8000,
     All = 0xFFFF,
 }

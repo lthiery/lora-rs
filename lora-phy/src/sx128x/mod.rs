@@ -1,5 +1,6 @@
 mod radio_kind_params;
 mod sx1280;
+use radio_kind_params::IrqMask::{CrcError, HeaderError};
 pub use sx1280::Sx1280;
 mod sx1281;
 pub use sx1281::Sx1281;
@@ -404,34 +405,17 @@ where
     }
 
     async fn do_rx(&mut self, rx_mode: RxMode) -> Result<(), RadioError> {
-        // let (num_symbols, mode) = match rx_mode {
-        //     RxMode::DutyCycle(_) => Err(RadioError::DutyCycleUnsupported),
-        //     RxMode::Single(ns) => Ok((ns.max(SX128X_MIN_LORA_SYMB_NUM_TIMEOUT), LoRaMode::RxSingle)),
-        //     RxMode::SingleMs(_) => Err(RadioError::TimedSingleRxUnsupported),
-        //     RxMode::Continuous => Ok((0, LoRaMode::RxContinuous)),
-        // }?;
-
-        // self.intf.iv.enable_rf_switch_rx().await?;
-
-        // self.set_lora_symbol_num_timeout(num_symbols).await?;
-
-        // let lna_gain = if self.config.rx_boost {
-        //     LnaGain::G1.boosted_value()
-        // } else {
-        //     LnaGain::G1.value()
-        // };
-        // self.write_register(Register::RegLna, lna_gain).await?;
-
-        // self.write_register(Register::RegFifoAddrPtr, 0x00u8).await?;
-
-        // // Interrupt flags stay latched until the host clears them by writing a 1
-        // // (SX1286 DS §4.1.2.4); entering Rx does not reset them. Clear here so a
-        // // flag left over from an earlier operation can't read as a result of this
-        // // one; this also covers listen(), which never calls set_irq_params.
-        // self.clear_irq_status().await?;
-
-        // self.write_register(Register::RegOpMode, mode.value()).await
-        todo!();
+        self.set_tx_rx_buffer_base_address(0, 0).await?;
+        self.clear_irq_status().await?;
+        let (period_base, period_base_count) = match rx_mode {
+            RxMode::Single(timeout) => (PeriodBase::_15_625us, timeout),
+            RxMode::SingleMs(ms) => (PeriodBase::_1ms, ms as u16),
+            RxMode::Continuous => (PeriodBase::_1ms, 0xFFFF),
+            RxMode::DutyCycle(_duty_cycle_params) => return Err(RadioError::InvalidConfiguration),
+        };
+        let pbb = period_base_count.to_be_bytes();
+        let buffer = [OpCode::SetRx as u8, period_base as u8, pbb[0], pbb[1]];
+        self.intf.write(&buffer, true).await
     }
 
     async fn get_rx_payload(
@@ -439,57 +423,42 @@ where
         rx_pkt_params: &PacketParams,
         receiving_buffer: &mut [u8],
     ) -> Result<u8, RadioError> {
-        // let payload_length = if rx_pkt_params.implicit_header {
-        //     rx_pkt_params.payload_length
-        // } else {
-        //     self.read_register(Register::RegRxNbBytes).await?
-        // };
-        // if (payload_length as usize) > receiving_buffer.len() {
-        //     return Err(RadioError::PayloadSizeMismatch(
-        //         payload_length as usize,
-        //         receiving_buffer.len(),
-        //     ));
-        // }
-        // let fifo_addr = self.read_register(Register::RegFifoRxCurrentAddr).await?;
-        // self.write_register(Register::RegFifoAddrPtr, fifo_addr).await?;
-        // self.read_buffer(Register::RegFifo, &mut receiving_buffer[0..payload_length as usize])
-        //     .await?;
-        // self.write_register(Register::RegFifoAddrPtr, 0x00u8).await?;
-
-        // Ok(payload_length)
-        todo!();
+        let payload_length = if rx_pkt_params.implicit_header {
+            rx_pkt_params.payload_length
+        } else {
+            let write_buffer = [OpCode::GetRxBufferStatus as u8, 0];
+            let mut read_buffer = [0; 2];
+            self.intf.read(&write_buffer, &mut read_buffer).await?;
+            read_buffer[0]
+        };
+        if (payload_length as usize) > receiving_buffer.len() {
+            return Err(RadioError::PayloadSizeMismatch(
+                payload_length as usize,
+                receiving_buffer.len(),
+            ));
+        }
+        // TODO: So far hard-coded
+        let fifo_offset = 0;
+        let write_buffer = [OpCode::ReadBuffer as u8, fifo_offset, 0];
+        let mut read_buffer = [0; 256];
+        self.intf
+            .read(&write_buffer, &mut read_buffer[0..payload_length as usize])
+            .await?;
+        receiving_buffer[0..payload_length as usize].copy_from_slice(&mut read_buffer[0..payload_length as usize]);
+        Ok(payload_length)
     }
 
     async fn get_rx_packet_status(&mut self) -> Result<PacketStatus, RadioError> {
-        // let snr = {
-        //     let packet_snr = self.read_register(Register::RegPktSnrValue).await?;
-        //     packet_snr as i8 as i16 / 4
-        // };
-
-        // let rssi = {
-        //     let packet_rssi = self.read_register(Register::RegPktRssiValue).await?;
-
-        //     let rssi_offset = C::rssi_offset(self).await?;
-
-        //     // Section 5.5.5: the 16/15 linearization applies to the raw
-        //     // packet RSSI in both branches (the reference driver and
-        //     // LoRaMac-node agree; only the negative-SNR term differs)
-        //     if snr >= 0 {
-        //         rssi_offset + linearize_rssi(packet_rssi)
-        //     } else {
-        //         rssi_offset + linearize_rssi(packet_rssi) + snr
-        //     }
-        // };
-
-        // Ok(PacketStatus { rssi, snr })
-        todo!();
+        let write_buffer = [OpCode::GetPacketStatus as u8, 0];
+        let mut read_buffer = [0; 5];
+        self.intf.read(&write_buffer, &mut read_buffer).await?;
+        let rssi = read_buffer[0] as i16;
+        let snr = read_buffer[1] as i16;
+        Ok(PacketStatus { rssi, snr })
     }
 
     async fn get_rssi(&mut self) -> Result<i16, RadioError> {
-        // let rssi_value = self.read_register(Register::RegRssiValue).await?;
-        // let rssi_offset = C::rssi_offset(self).await?;
-        // Ok(rssi_offset + rssi_value as i16)
-        todo!();
+        Ok(self.get_rx_packet_status().await?.rssi)
     }
 
     async fn do_cad(&mut self, _mdltn_params: &ModulationParams) -> Result<(), RadioError> {
@@ -508,23 +477,52 @@ where
     // Set the IRQ mask to disable unwanted interrupts,
     // enable interrupts on DIO pins (sx128x has multiple),
     // and allow interrupts.
-    async fn set_irq_params(&mut self, _radio_mode: Option<RadioMode>) -> Result<(), RadioError> {
+    async fn set_irq_params(&mut self, radio_mode: Option<RadioMode>) -> Result<(), RadioError> {
+        debug!("sx128x::set_irq_params");
         self.clear_irq_status().await?;
-        // Taken from ELRS
-        let irq_mask = IrqMask::TxDone.value()
-            | IrqMask::RxDone.value()
-            | IrqMask::SyncWordValid.value()
-            | IrqMask::SyncWordError.value()
-            | IrqMask::CrcError.value();
-        let dio1_mask = IrqMask::TxDone.value() | IrqMask::RxDone.value();
-        let dio2_mask: u16 = 0;
-        let dio3_mask: u16 = 0;
-        let mut buffer = [OpCode::SetDioIrqParams as u8, 0, 0, 0, 0, 0, 0, 0, 0];
-        buffer[1..3].copy_from_slice(&irq_mask.to_be_bytes());
-        buffer[3..5].copy_from_slice(&dio1_mask.to_be_bytes());
-        buffer[5..7].copy_from_slice(&dio2_mask.to_be_bytes());
-        buffer[7..9].copy_from_slice(&dio3_mask.to_be_bytes());
-        self.intf.write(&buffer, true).await
+        if let Some(radio_mode) = radio_mode {
+            match radio_mode {
+                RadioMode::Sleep | RadioMode::Standby => {
+                    let buffer = irq_dio1_buffer_from_params(0, 0, 0, 0);
+                    self.intf.write(&buffer, true).await?
+                }
+                RadioMode::FrequencySynthesis => todo!(),
+                RadioMode::Transmit => {
+                    // Taken from RadioLib
+                    let irq_mask = IrqMask::TxDone.value()
+                        | IrqMask::RxDone.value()
+                        | IrqMask::SyncWordValid.value()
+                        | IrqMask::SyncWordError.value()
+                        | IrqMask::CrcError.value();
+                    let dio1_mask = IrqMask::TxDone.value() | IrqMask::RxDone.value();
+                    let dio2_mask: u16 = 0;
+                    let dio3_mask: u16 = 0;
+                    let buffer = irq_dio1_buffer_from_params(irq_mask, dio1_mask, dio2_mask, dio3_mask);
+                    self.intf.write(&buffer, true).await?
+                }
+                RadioMode::Receive(rx_mode) => match rx_mode {
+                    RxMode::Single(_) => todo!(),
+                    RxMode::SingleMs(_) => todo!(),
+                    RxMode::Continuous => {
+                        // Taken from RadioLib
+                        let irq_mask = IrqMask::RxDone.value()
+                            | IrqMask::HeaderValid.value()
+                            | IrqMask::HeaderError.value()
+                            | IrqMask::CrcError.value()
+                            | IrqMask::RxTxTimeout.value();
+                        let dio1_mask = IrqMask::RxDone.value() | IrqMask::RxTxTimeout.value();
+                        let dio2_mask: u16 = 0;
+                        let dio3_mask: u16 = 0;
+                        let buffer = irq_dio1_buffer_from_params(irq_mask, dio1_mask, dio2_mask, dio3_mask);
+                        self.intf.write(&buffer, true).await?
+                    }
+                    RxMode::DutyCycle(_duty_cycle_params) => todo!(),
+                },
+                RadioMode::Listen => todo!(),
+                RadioMode::ChannelActivityDetection => todo!(),
+            }
+        }
+        Ok(())
     }
 
     async fn await_irq(&mut self) -> Result<(), RadioError> {
@@ -542,25 +540,26 @@ where
         self.intf.read(&write_buffer, &mut read_buffer).await?;
         let irq_flags = u16::from_be_bytes(read_buffer);
         match radio_mode {
+            RadioMode::Receive(RxMode::Continuous | RxMode::Single(_) | RxMode::SingleMs(_)) => {
+                if (irq_flags & IrqMask::RxDone.value()) == IrqMask::RxDone.value() {
+                    debug!("RxDone in radio mode {}", radio_mode);
+                    return Ok(Some(IrqState::Done));
+                }
+                if (irq_flags & IrqMask::RxTxTimeout.value()) == IrqMask::RxTxTimeout.value() {
+                    debug!("RxTxTimeout in radio mode {}", radio_mode);
+                    return Err(RadioError::ReceiveTimeout);
+                }
+                if IrqMask::HeaderValid.is_set_in(irq_flags) {
+                    debug!("HeaderValid in radio mode {}", radio_mode);
+                    return Ok(Some(IrqState::PreambleReceived));
+                }
+            }
             RadioMode::Transmit => {
                 if (irq_flags & IrqMask::TxDone.value()) == IrqMask::TxDone.value() {
                     debug!("TxDone in radio mode {}", radio_mode);
                     return Ok(Some(IrqState::Done));
                 }
-            } // RadioMode::Receive(RxMode::Continuous | RxMode::Single(_) | RxMode::SingleMs(_)) => {
-            //     if (irq_flags & IrqMask::RxDone.value()) == IrqMask::RxDone.value() {
-            //         debug!("RxDone in radio mode {}", radio_mode);
-            //         return Ok(Some(IrqState::Done));
-            //     }
-            //     if (irq_flags & IrqMask::RxTimeout.value()) == IrqMask::RxTimeout.value() {
-            //         debug!("RxTimeout in radio mode {}", radio_mode);
-            //         return Err(RadioError::ReceiveTimeout);
-            //     }
-            //     if IrqMask::HeaderValid.is_set_in(irq_flags) {
-            //         debug!("HeaderValid in radio mode {}", radio_mode);
-            //         return Ok(Some(IrqState::PreambleReceived));
-            //     }
-            // }
+            }
             // RadioMode::ChannelActivityDetection => {
             //     if (irq_flags & IrqMask::CADDone.value()) == IrqMask::CADDone.value() {
             //         debug!("CADDone in radio mode {}", radio_mode);
@@ -614,6 +613,15 @@ where
     async fn set_tx_continuous_wave_mode(&mut self) -> Result<(), RadioError> {
         C::set_tx_continuous_wave_mode(self).await
     }
+}
+
+fn irq_dio1_buffer_from_params(irq_mask: u16, dio1_mask: u16, dio2_mask: u16, dio3_mask: u16) -> [u8; 9] {
+    let mut buffer = [OpCode::SetDioIrqParams as u8, 0, 0, 0, 0, 0, 0, 0, 0];
+    buffer[1..3].copy_from_slice(&irq_mask.to_be_bytes());
+    buffer[3..5].copy_from_slice(&dio1_mask.to_be_bytes());
+    buffer[5..7].copy_from_slice(&dio2_mask.to_be_bytes());
+    buffer[7..9].copy_from_slice(&dio3_mask.to_be_bytes());
+    buffer
 }
 
 #[cfg(test)]
