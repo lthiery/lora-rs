@@ -17,6 +17,7 @@ exclude = [
     "hil-test/tests-hil",
     "hil-test/tests-hil-fw",
     "hil-test/tests-hil-fw-l072",
+    "hil-test/relay-icd",
 ]
 resolver = "2"
 
