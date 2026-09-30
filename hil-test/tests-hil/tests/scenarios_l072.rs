@@ -9,8 +9,8 @@
 
 mod common;
 
-use common::{join_dlsettings, join_never, join_ok};
 use banc_host::DeviceSuite;
+use common::{join_dlsettings, join_never, join_ok};
 use lora_hil_harness::{JoinAcceptParams, JoinPolicy, RxWindow};
 
 banc_host::paired_suite! {

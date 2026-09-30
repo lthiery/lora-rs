@@ -37,19 +37,15 @@ where
 {
     /// Create an InterfaceVariant instance for an stm32wl/sx1262 combination
     pub fn new(
-        _irq: impl interrupt::typelevel::Binding<interrupt::typelevel::SUBGHZ_RADIO, InterruptHandler> + 'static,
+        _irq: impl interrupt::typelevel::Binding<interrupt::typelevel::SUBGHZ_RADIO, InterruptHandler>
+            + 'static,
         use_high_power_pa: bool,
         rf_switch_rx: Option<CTRL>,
         rf_switch_tx: Option<CTRL>,
         rf_switch_en: Option<CTRL>,
     ) -> Result<Self, RadioError> {
         interrupt::SUBGHZ_RADIO.disable();
-        Ok(Self {
-            use_high_power_pa,
-            rf_switch_rx,
-            rf_switch_tx,
-            rf_switch_en,
-        })
+        Ok(Self { use_high_power_pa, rf_switch_rx, rf_switch_tx, rf_switch_en })
     }
 }
 
@@ -89,8 +85,7 @@ where
     }
     async fn enable_rf_switch_tx(&mut self) -> Result<(), RadioError> {
         if let Some(pin) = &mut self.rf_switch_rx {
-            pin.set_state((!self.use_high_power_pa).into())
-                .map_err(|_| RfSwitchTx)?
+            pin.set_state((!self.use_high_power_pa).into()).map_err(|_| RfSwitchTx)?
         }
         if let Some(pin) = &mut self.rf_switch_tx {
             pin.set_high().map_err(|_| RfSwitchTx)?
@@ -120,7 +115,10 @@ impl<T: SpiBus> ErrorType for SubghzSpiDevice<T> {
 }
 
 impl<T: SpiBus> SpiDevice for SubghzSpiDevice<T> {
-    async fn transaction(&mut self, operations: &mut [Operation<'_, u8>]) -> Result<(), Self::Error> {
+    async fn transaction(
+        &mut self,
+        operations: &mut [Operation<'_, u8>],
+    ) -> Result<(), Self::Error> {
         pac::PWR.subghzspicr().modify(|w| w.set_nss(false));
 
         let op_res = 'ops: {

@@ -19,7 +19,9 @@ mod tests {
     use lora_phy::lorawan_radio::LorawanRadio;
     use lora_phy::sx126x::{self, Stm32wl, Sx126x, TcxoCtrlVoltage};
     use lora_phy::LoRa;
-    use lorawan_device::async_device::{Device, EmbassyTimer, JoinMode, JoinResponse, SendResponse};
+    use lorawan_device::async_device::{
+        Device, EmbassyTimer, JoinMode, JoinResponse, SendResponse,
+    };
     use lorawan_device::region::{Subband, US915};
     use lorawan_device::{AppEui, AppKey, DevEui};
 
@@ -84,8 +86,14 @@ mod tests {
             use_dcdc: true,
             rx_boost: false,
         };
-        let iv =
-            Stm32wlInterfaceVariant::new(Irqs, use_high_power_pa, Some(ctrl1), Some(ctrl2), Some(ctrl3)).unwrap();
+        let iv = Stm32wlInterfaceVariant::new(
+            Irqs,
+            use_high_power_pa,
+            Some(ctrl1),
+            Some(ctrl2),
+            Some(ctrl3),
+        )
+        .unwrap();
         let lora = LoRa::new(Sx126x::new(spi, iv, config), true, Delay).await.unwrap();
 
         let radio: LorawanRadio<_, _, MAX_TX_POWER> = lora.into();

@@ -24,7 +24,9 @@ mod tests {
     use lora_phy::lorawan_radio::LorawanRadio;
     use lora_phy::sx127x::{self, Sx1276, Sx127x};
     use lora_phy::LoRa;
-    use lorawan_device::async_device::{Device, EmbassyTimer, JoinMode, JoinResponse, SendResponse};
+    use lorawan_device::async_device::{
+        Device, EmbassyTimer, JoinMode, JoinResponse, SendResponse,
+    };
     use lorawan_device::region::{Subband, US915};
     use lorawan_device::{AppEui, AppKey, DevEui};
 
@@ -49,7 +51,10 @@ mod tests {
                     Output<'static>,
                     Delay,
                 >,
-                GenericSx127xInterfaceVariant<Output<'static>, ExtiInput<'static, embassy_stm32::mode::Async>>,
+                GenericSx127xInterfaceVariant<
+                    Output<'static>,
+                    ExtiInput<'static, embassy_stm32::mode::Async>,
+                >,
                 Sx1276,
             >,
             Delay,
@@ -106,12 +111,8 @@ mod tests {
         let spi = Spi::new(p.SPI1, p.PB3, p.PA7, p.PA6, p.DMA1_CH3, p.DMA1_CH2, Irqs, spi_config);
         let spi = ExclusiveDevice::new(spi, nss, Delay).unwrap();
 
-        let config = sx127x::Config {
-            chip: Sx1276,
-            tcxo_used: true,
-            rx_boost: false,
-            tx_boost: false,
-        };
+        let config =
+            sx127x::Config { chip: Sx1276, tcxo_used: true, rx_boost: false, tx_boost: false };
         let iv = GenericSx127xInterfaceVariant::new_with_secondary_irq(
             reset,
             dio0,
@@ -126,7 +127,12 @@ mod tests {
         let mut us915 = US915::new();
         us915.set_join_bias(Subband::_2);
         static DEVICE: static_cell::StaticCell<HilDevice> = static_cell::StaticCell::new();
-        Dev(DEVICE.init(Device::new(us915.into(), radio, EmbassyTimer::new(), Rng::new(p.RNG, Irqs))))
+        Dev(DEVICE.init(Device::new(
+            us915.into(),
+            radio,
+            EmbassyTimer::new(),
+            Rng::new(p.RNG, Irqs),
+        )))
     }
 
     /// Plumbing smoke test: no radio use; proves embedded-test + probe-rs +
