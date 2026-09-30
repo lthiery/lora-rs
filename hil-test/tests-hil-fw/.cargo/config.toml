@@ -1,6 +1,7 @@
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
-# Proxies the ELF to the lora-hil Pi and runs probe-rs there.
-runner = "./remote-runner.sh"
+# Flashes the bench DUT through probe-rs remote; chip, probe and server come
+# from the rig config as BANC_TARGET_* (see ../probe-rs-runner.sh).
+runner = "../probe-rs-runner.sh"
 
 [build]
 target = "thumbv7em-none-eabi"

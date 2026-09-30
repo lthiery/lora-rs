@@ -78,6 +78,23 @@ jobs:
           name = "relay"
           addr = "127.0.0.1:4830"
           token_file = "/home/runner/.config/lora-hil/rigd-token"
+
+          # The DUTs, as the suites name them; probe-rs serve on the rig is
+          # reached through the second tunnel.
+          [[target]]
+          name = "wl55"
+          chip = "STM32WL55JCIx"
+          probe = "0483:374e:002700443234511733353533"
+          probe_host = "ws://127.0.0.1:3000"
+          token_file = "/home/runner/.config/lora-hil/probe-rs-token"
+
+          [[target]]
+          name = "l072"
+          chip = "STM32L072CZTx"
+          probe = "0483:374b:066EFF495351677867143312"
+          probe_host = "ws://127.0.0.1:3000"
+          token_file = "/home/runner/.config/lora-hil/probe-rs-token"
+          params = { connect_under_reset = true }
           EOF
 
       - name: Preflight rig reachability
@@ -95,8 +112,6 @@ jobs:
           BANC_LEASE_HOLDER: gh-run-${{ github.run_id }}
           HIL_FW_OFFLINE: "0"
           CARGO_TARGET_DIR: /tmp/hil-target
-          PROBE_RS_HOST: ws://127.0.0.1:3000
-          PROBE_RS_TOKEN_FILE: /home/runner/.config/lora-hil/probe-rs-token
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
           cd "$GITHUB_WORKSPACE/hil-test/tests-hil"

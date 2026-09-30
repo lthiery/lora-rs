@@ -1,6 +1,6 @@
 //! Two-sided HIL scenarios for the NUCLEO-WL55JC DUT: each test pairs the
 //! network-side fixture with an on-target embedded-test in ../tests-hil-fw,
-//! invoked over the cargo runner (probe-rs on the lora-hil Pi).
+//! flashed through that crate's cargo runner on the rig target named "wl55".
 //!
 //! Runs on the banc harness (github.com/lthiery/banc) via `paired_suite!`:
 //! each scenario is declared next to the name of its device-side twin, gets a
@@ -58,5 +58,6 @@ fn device_suite() -> DeviceSuite {
     common::device_suite(
         "HIL_FW_CRATE",
         concat!(env!("CARGO_MANIFEST_DIR"), "/../tests-hil-fw").into(),
+        "wl55",
     )
 }

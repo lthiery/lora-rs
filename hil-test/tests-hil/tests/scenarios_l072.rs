@@ -1,7 +1,8 @@
 //! Two-sided HIL scenarios for the B-L072Z-LRWAN1 DUT (SX1276 via the Murata
 //! CMWX1ZZABZ module): the same five scenarios as scenarios.rs, driving the
 //! on-target embedded-tests in ../tests-hil-fw-l072. See scenarios.rs for the
-//! suite mechanics; the two differ only in which firmware crate they flash.
+//! suite mechanics; the two differ only in which firmware crate they flash
+//! and which rig target ("l072") it goes to.
 //!
 //! This DUT joins as DevEUI 00..02 (same AppKey), so bench captures can tell
 //! the boards apart. Scenarios from both suites serialize on the banc rig
@@ -51,5 +52,6 @@ fn device_suite() -> DeviceSuite {
     common::device_suite(
         "HIL_FW_CRATE_L072",
         concat!(env!("CARGO_MANIFEST_DIR"), "/../tests-hil-fw-l072").into(),
+        "l072",
     )
 }

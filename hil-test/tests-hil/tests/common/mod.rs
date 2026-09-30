@@ -14,12 +14,15 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 /// Firmware crate to build/flash; the env var overrides for CI, where the
 /// device tests come from the workflow's checkout rather than the bench one.
+/// `target` names the rig's `[[target]]` entry for the board this crate
+/// runs on: its chip, probe and probe-rs server reach the crate's cargo
+/// runner as BANC_TARGET_* environment, so nothing rig-specific lives here.
 /// --offline is the bench default (the lounas sandbox hangs cargo's network
-/// probe); HIL_FW_OFFLINE=0 drops it for the CI container, which has no
+/// probe); HIL_FW_OFFLINE=0 drops it for the CI runner, which has no
 /// registry cache on purpose and fetches from crates.io.
-pub fn device_suite(env_var: &str, default_crate_dir: String) -> DeviceSuite {
+pub fn device_suite(env_var: &str, default_crate_dir: String, target: &str) -> DeviceSuite {
     let fw_crate = std::env::var(env_var).unwrap_or(default_crate_dir);
-    let mut suite = DeviceSuite::new(fw_crate, "join");
+    let mut suite = DeviceSuite::new(fw_crate, "join").target(target);
     suite.cargo_args.push("--release".into());
     if std::env::var("HIL_FW_OFFLINE").map(|v| v != "0").unwrap_or(true) {
         suite.cargo_args.push("--offline".into());
