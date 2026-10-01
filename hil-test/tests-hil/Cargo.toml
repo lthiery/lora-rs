@@ -24,8 +24,7 @@ lora-modulation = "0.1.5"
 # 0.0.6: named rig targets (the DUT's chip/probe/server come from the rig
 # config), network node transport + rig lease for remote (CI) rigs. A regular
 # dependency because the relay pump lives in the fixture lib.
-# LOCAL until 0.0.6 is on crates.io; then `banc-host = "0.0.6"`.
-banc-host = { path = "/home/louis/banc/banc-host" }
+banc-host = "0.0.6"
 lora-hil-relay-icd = { path = "../relay-icd" }
 anyhow = "1"
 

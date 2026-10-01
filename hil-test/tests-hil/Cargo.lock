@@ -102,11 +102,14 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 [[package]]
 name = "banc-host"
 version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7da9777803caf5c74741d0838caedfdd8bfa36b5372687caeeccc4f14ee108ce"
 dependencies = [
  "anyhow",
  "banc-icd",
  "fs4",
  "getrandom 0.3.4",
+ "libc",
  "libtest-mimic",
  "postcard",
  "postcard-rpc",
@@ -120,6 +123,8 @@ dependencies = [
 [[package]]
 name = "banc-icd"
 version = "0.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb3253a5fc071cfdd27a6665d258a20fd7dcde106f1998e81ea18ba1a0147bc6"
 dependencies = [
  "heapless 0.8.0",
  "postcard-rpc",
