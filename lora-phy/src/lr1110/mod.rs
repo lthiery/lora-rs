@@ -50,6 +50,7 @@ use crate::lr1110_interface::Lr1110SpiInterface;
 use crate::mod_params::*;
 use crate::mod_traits::IrqState;
 use crate::{InterfaceVariant, RadioKind};
+use lora_modulation::BaseBandModulationParams;
 pub use radio_kind_params::{PaSelection, SetDioAsRfSwitchParams};
 
 // Internal frequency of the radio
@@ -1993,13 +1994,10 @@ where
             return Err(RadioError::InvalidBandwidthForFrequency);
         }
 
-        let mut low_data_rate_optimize = 0x00u8;
-        if (((spreading_factor == SpreadingFactor::_11) || (spreading_factor == SpreadingFactor::_12))
-            && (bandwidth == Bandwidth::_125KHz))
-            || ((spreading_factor == SpreadingFactor::_12) && (bandwidth == Bandwidth::_250KHz))
-        {
-            low_data_rate_optimize = 0x01u8;
-        }
+        let low_data_rate_optimize = u8::from(BaseBandModulationParams::low_data_rate_optimize(
+            spreading_factor,
+            bandwidth,
+        ));
 
         Ok(ModulationParams {
             spreading_factor,
@@ -2408,10 +2406,9 @@ where
         let mut pkt_status = [0u8; 3];
         self.read_command(&cmd, &mut pkt_status).await?;
 
-        // RSSI = -pkt_status[0] / 2
-        let rssi = ((-(pkt_status[0] as i32)) >> 1) as i16;
-        // SNR = (pkt_status[1] + 2) / 4
-        let snr = (((pkt_status[1] as i8) + 2) >> 2) as i16;
+        // RssiPkt = -raw / 2 dBm, SnrPkt = raw (signed) / 4 dB
+        let rssi = Rssi::from_quarter_dbm(-2 * pkt_status[0] as i16);
+        let snr = Snr::from_quarter_db(pkt_status[1] as i8 as i16);
 
         Ok(PacketStatus { rssi, snr })
     }

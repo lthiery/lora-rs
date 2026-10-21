@@ -9,7 +9,7 @@ use fixtures::{Delayer, TestFixture, get_sx126x, get_sx1262};
 use crate::LoRa;
 use crate::mod_params::{RadioError, RadioMode, RxMode};
 use crate::mod_traits::RadioKind;
-use crate::sx126x::{Sx126x, Sx1261};
+use crate::sx126x::{Register, Sx126x, Sx1261};
 use lora_modulation::{Bandwidth, CodingRate, SpreadingFactor};
 use smtc_modem_cores::sx126x::{
     Context, SleepCfg, sx126x_cad_exit_modes_e, sx126x_cad_params_t, sx126x_cad_symbs_e, sx126x_lora_bw_e,
@@ -85,6 +85,22 @@ async fn test_modulation_params() {
             sx126x_lora_bw_e::SX126X_LORA_BW_125,
             1u8,
         ),
+        // symbol duration exactly 16.384ms
+        (
+            SpreadingFactor::_12,
+            Bandwidth::_250KHz,
+            sx126x_lora_sf_e::SX126X_LORA_SF12,
+            sx126x_lora_bw_e::SX126X_LORA_BW_250,
+            1u8,
+        ),
+        // symbol duration exactly 16.384ms
+        (
+            SpreadingFactor::_9,
+            Bandwidth::_31KHz,
+            sx126x_lora_sf_e::SX126X_LORA_SF9,
+            sx126x_lora_bw_e::SX126X_LORA_BW_031,
+            1u8,
+        ),
     ];
     for (sf, bw, c_sf, c_bw, ldro) in cases {
         let mut reference = reference();
@@ -101,6 +117,43 @@ async fn test_modulation_params() {
         assert_eq!(mdltn_params.low_data_rate_optimize, ldro, "ldro for {sf:?}/{bw:?}");
         sx1261.set_modulation_params(&mdltn_params).await.unwrap();
         assert_eq!(sx1261.take_spi(), reference.inner, "{sf:?}/{bw:?}");
+    }
+}
+
+#[test]
+fn test_all_modulation_params_for_ldro() {
+    // LDRO per (SF and BW), Semtech ral_compute_lora_ldro table
+    let expected: [(SpreadingFactor, [u8; 10]); 8] = [
+        (SpreadingFactor::_5, [1, 1, 1, 1, 1, 0, 0, 0, 0, 0]),
+        (SpreadingFactor::_6, [1, 1, 1, 1, 1, 0, 0, 0, 0, 0]),
+        (SpreadingFactor::_7, [1, 1, 1, 1, 1, 0, 0, 0, 0, 0]),
+        (SpreadingFactor::_8, [1, 1, 1, 1, 1, 0, 0, 0, 0, 0]),
+        (SpreadingFactor::_9, [1, 1, 1, 1, 1, 1, 0, 0, 0, 0]),
+        (SpreadingFactor::_10, [1, 1, 1, 1, 1, 1, 1, 0, 0, 0]),
+        (SpreadingFactor::_11, [1, 1, 1, 1, 1, 1, 1, 1, 0, 0]),
+        (SpreadingFactor::_12, [1, 1, 1, 1, 1, 1, 1, 1, 1, 0]),
+    ];
+    let bws = [
+        Bandwidth::_7KHz,
+        Bandwidth::_10KHz,
+        Bandwidth::_15KHz,
+        Bandwidth::_20KHz,
+        Bandwidth::_31KHz,
+        Bandwidth::_41KHz,
+        Bandwidth::_62KHz,
+        Bandwidth::_125KHz,
+        Bandwidth::_250KHz,
+        Bandwidth::_500KHz,
+    ];
+
+    let sx1261 = get_sx126x();
+    for (sf, row) in expected {
+        for (bw, want) in bws.iter().zip(row) {
+            let params = sx1261
+                .create_modulation_params(sf, *bw, CodingRate::_4_5, TEST_FREQ_HZ)
+                .unwrap();
+            assert_eq!(params.low_data_rate_optimize, want, "ldro for {sf:?}/{bw:?}");
+        }
     }
 }
 
@@ -294,10 +347,37 @@ async fn test_get_packet_status() {
     let mut reference = Context::new(fixture);
     let (_, c_status) = reference.get_lora_pkt_status();
 
-    // Byte streams and the decoded values both match the reference
+    // Byte streams and the whole-unit values both match the reference
     assert_eq!(sx1261.take_spi(), reference.inner);
-    assert_eq!(pkt_status.rssi, c_status.rssi_pkt_in_dbm as i16);
-    assert_eq!(pkt_status.snr, c_status.snr_pkt_in_db as i16);
+    assert_eq!(pkt_status.rssi.dbm(), c_status.rssi_pkt_in_dbm as i16);
+    assert_eq!(pkt_status.snr.db(), c_status.snr_pkt_in_db as i16);
+    // and the chip's own resolution is kept: -80 dBm, 5 dB
+    assert_eq!(pkt_status.rssi.quarter_dbm(), -320);
+    assert_eq!(pkt_status.snr.quarter_db(), 20);
+}
+
+#[tokio::test]
+async fn test_get_packet_status_half_db() {
+    // Odd raw values: rssi 179 = -89.5 dBm, snr 0xF9 = -7 = -1.75 dB, snr 10 = 2.5 dB
+    for (raw_rssi, raw_snr) in [(179u8, 0xF9u8), (179, 10), (0, 0x80), (255, 0x7F)] {
+        let mut sx1261 = get_sx126x();
+        sx1261.spi_mut().prime_read(&[0x14], &[0x00, raw_rssi, raw_snr, 0]);
+        let pkt_status = sx1261.get_rx_packet_status().await.unwrap();
+
+        let mut fixture = TestFixture::new();
+        fixture.prime_read(&[0x14, 0x00], &[raw_rssi, raw_snr, 0]);
+        let mut reference = Context::new(fixture);
+        let (_, c_status) = reference.get_lora_pkt_status();
+
+        assert_eq!(pkt_status.rssi.quarter_dbm(), -2 * raw_rssi as i16);
+        assert_eq!(pkt_status.snr.quarter_db(), raw_snr as i8 as i16);
+        assert_eq!(
+            pkt_status.rssi.dbm(),
+            c_status.rssi_pkt_in_dbm as i16,
+            "rssi raw {raw_rssi}"
+        );
+        assert_eq!(pkt_status.snr.db(), c_status.snr_pkt_in_db as i16, "snr raw {raw_snr}");
+    }
 }
 
 #[tokio::test]
@@ -528,8 +608,8 @@ async fn test_emulated_rx_end_to_end() {
     let mut buf = [0u8; 255];
     let (len, status) = lora.rx(&rx_pkt_params, &mut buf).await.unwrap();
     assert_eq!(&buf[..len as usize], b"ping");
-    assert_eq!(status.rssi, -80);
-    assert_eq!(status.snr, 5);
+    assert_eq!(status.rssi.dbm(), -80);
+    assert_eq!(status.snr.db(), 5);
 }
 
 #[tokio::test]
@@ -653,6 +733,48 @@ async fn test_emulated_sleep_and_wake() {
         assert_eq!(m.tx_log.len(), 1);
         assert_eq!(m.tx_log[0].payload, b"wake");
     });
+}
+
+#[tokio::test]
+async fn test_init_rejects_impossible_retention_count() {
+    for count in [5, 0xFF] {
+        let chip = Chip::new();
+        chip.with_model(|m| m.registers.insert(Register::RetentionList as u16, count));
+        let got = get_emulated_sx1261(&chip).init_lora(0x3444).await;
+        assert!(
+            matches!(got, Err(RadioError::InvalidConfiguration)),
+            "count {count}: {got:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_retention_list_skips_register_already_present() {
+    // One entry, RxGain (0x08AC): adding it again must not rewrite the list.
+    const RETENTION_READ: [u8; 4] = [0x1D, 0x02, 0x9F, 0x00];
+    const RETENTION_WITH_RX_GAIN: [u8; 9] = [1, 0x08, 0xAC, 0, 0, 0, 0, 0, 0];
+
+    let mut sx1261 = get_sx126x();
+    sx1261.spi_mut().prime_read(&RETENTION_READ, &RETENTION_WITH_RX_GAIN);
+
+    assert_eq!(sx1261.add_register_to_retention_list(Register::RxGain).await, Ok(()));
+    assert!(sx1261.take_spi().writes().is_empty());
+}
+
+#[tokio::test]
+async fn test_retention_list_full_rejects_new_register() {
+    // Four entries, none of them TxModulation (0x0889).
+    const RETENTION_READ: [u8; 4] = [0x1D, 0x02, 0x9F, 0x00];
+    const RETENTION_FULL: [u8; 9] = [4, 0x08, 0xAC, 0x07, 0x36, 0x08, 0xE2, 0x08, 0xE5];
+
+    let mut sx1261 = get_sx126x();
+    sx1261.spi_mut().prime_read(&RETENTION_READ, &RETENTION_FULL);
+
+    assert_eq!(
+        sx1261.add_register_to_retention_list(Register::TxModulation).await,
+        Err(RadioError::InvalidConfiguration)
+    );
+    assert!(sx1261.take_spi().writes().is_empty());
 }
 
 #[tokio::test]

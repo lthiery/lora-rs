@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 
 ## Unreleased
 
+- Breaking: `PacketStatus::rssi` and `PacketStatus::snr` are now the `Rssi` and `Snr` newtypes in units of 0.25 dB, keeping the chip's resolution (0.5 dB RSSI and 0.25 dB SNR on sx126x and lr1110, 0.25 dB SNR on sx127x). `Rssi::dbm()` and `Snr::db()` give whole units with the previous rounding on sx126x and lr1110; on sx127x the whole-dB values can differ by 1 dB from before (#494)
 - Report a payload CRC failure as `RadioError::CrcError` and a header CRC failure as `RadioError::HeaderError` from `rx()` on sx126x, sx127x and lr1110, instead of handing up a corrupted buffer or waiting on a frame that will never complete
 - lorawan-radio: Treat a CRC or header error in an RX window as a window timeout, and keep listening after one in Class C continuous receive
 - Move to Rust edition 2024 (requires Rust 1.85+)
@@ -18,6 +19,7 @@ and this project adheres to [Semantic Versioning](http://semver.org/).
 - Disable `default-features` for lorawan-device dependency
 - Preparations for Rust 2024 edition
 - sx126x: Fix IRQ processing order to handle Timeout before Preamble
+- lr1110, sx126x, sx127x: Take LDRO from `BaseBandModulationParams::low_data_rate_optimize` (Semtech's SF/BW table); fixes SF11/BW125 and SF12/BW250 on sx127x and all narrow-bandwidth cases on sx126x and lr1110 (#491)
 - sx127x: Switch to integer math for frequency handling
 - Make defmt optional
 

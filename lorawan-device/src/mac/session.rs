@@ -123,6 +123,12 @@ impl Session {
         self.fcnt_down
     }
 
+    /// Set the downlink counter when restoring a persisted session. On a live session
+    /// the counter only advances through `handle_rx`, which enforces the replay window.
+    pub(crate) fn restore_fcnt_down(&mut self, fcnt_down: Option<u32>) {
+        self.fcnt_down = fcnt_down;
+    }
+
     pub fn get_session_keys(&self) -> Option<SessionKeys> {
         Some(SessionKeys { nwkskey: self.nwkskey, appskey: self.appskey, devaddr: self.devaddr })
     }
@@ -299,7 +305,12 @@ impl Session {
 
         if retransmit {
             self.retransmissions += 1;
-            return Response::Retransmit;
+            // Confirmed repetitions wait RETRANSMIT_TIMEOUT; unconfirmed ones do not.
+            return if self.confirmed {
+                Response::RetransmitConfirmed
+            } else {
+                Response::Retransmit
+            };
         }
 
         self.retransmissions = 0;

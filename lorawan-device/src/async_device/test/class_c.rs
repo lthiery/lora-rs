@@ -81,6 +81,68 @@ async fn test_class_c_data_before_rx2() {
 }
 
 #[tokio::test]
+async fn test_class_c_downlink_during_retransmit_timeout() {
+    let (radio, timer, mut async_device) = util::setup_with_session_class_c().await;
+    // Run the device
+    let task = tokio::spawn(async move {
+        let response = async_device.send(&[1, 2, 3], 3, true).await;
+        (async_device, response)
+    });
+
+    // No downlink in RX1 or RX2
+    timer.fire_most_recent().await; // RX1 start
+    radio.handle_timeout().await; // RX1 end
+    timer.fire_most_recent().await; // RX2 start
+    radio.handle_timeout().await; // RX2 end
+
+    // Class C keeps listening in RXC during the RETRANSMIT_TIMEOUT.
+    radio.handle_rxtx(class_c_downlink::<1>).await;
+
+    let (mut device, response) = task.await.unwrap();
+    // The accepted downlink ends the uplink cycle, as it would in RX1/RX2
+    match response {
+        Ok(SendResponse::DownlinkReceived(1)) => (),
+        _ => {
+            panic!()
+        }
+    }
+    let downlink = device.take_downlink().unwrap();
+    assert_eq!(downlink.data, [1, 2, 3]);
+    assert_eq!(downlink.fport, 3);
+}
+
+#[tokio::test]
+async fn test_class_c_downlink_during_confirmed_repetition_wait() {
+    let (radio, timer, mut async_device) = util::setup_with_session_class_c().await;
+    async_device.mac.configuration.nb_trans = 3;
+    let task = tokio::spawn(async move {
+        let response = async_device.send(&[1, 2, 3], 3, true).await;
+        (async_device, response)
+    });
+
+    // No downlink in RX1 or RX2 of the first copy
+    timer.fire_most_recent().await; // RX1 start
+    radio.handle_timeout().await; // RX1 end
+    timer.fire_most_recent().await; // RX2 start
+    radio.handle_timeout().await; // RX2 end
+
+    // A downlink in RXC during the RETRANSMIT_TIMEOUT before the second copy
+    // ends the retransmission cycle: no second copy is sent.
+    radio.handle_rxtx(class_c_downlink::<1>).await;
+
+    let (mut device, response) = task.await.unwrap();
+    match response {
+        Ok(SendResponse::DownlinkReceived(1)) => (),
+        _ => {
+            panic!()
+        }
+    }
+    let downlink = device.take_downlink().unwrap();
+    assert_eq!(downlink.data, [1, 2, 3]);
+    assert_eq!(device.get_session().unwrap().fcnt_up, 2);
+}
+
+#[tokio::test]
 async fn test_class_c_async_down() {
     let (radio, _timer, mut async_device) = util::setup_with_session_class_c().await;
     // Run the device

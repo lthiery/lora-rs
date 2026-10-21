@@ -148,12 +148,15 @@ fn test_confirmed_uplink_no_ack_retransmission() {
         let response = device.handle_event(Event::TimeoutFired).unwrap(); // begin Rx2
         assert!(matches!(response, Response::TimeoutRequest(2100)));
         let response = device.handle_event(Event::TimeoutFired).unwrap(); // end Rx2
+        // RETRANSMIT_TIMEOUT (1..=3 s) after RX2 closes at t = 2100
+        assert!(matches!(response, Response::TimeoutRequest(t) if (3100..=5100).contains(&t)));
+        let response = device.handle_event(Event::TimeoutFired).unwrap(); // retransmit timeout
         if attempt == 0 {
             // NbTrans allows one more transmission
             assert!(matches!(response, Response::TimeoutRequest(1000)));
             let _second = device.get_radio().take_last_uplink().unwrap();
         } else {
-            // No confirmation after all NbTrans attempts
+            // No confirmation after all NbTrans attempts: NoAck is reported
             assert!(matches!(response, Response::NoAck));
         }
     }
@@ -174,6 +177,10 @@ fn test_confirmed_uplink_no_ack() {
     let response = device.handle_event(Event::TimeoutFired).unwrap(); // being Rx2
     assert!(matches!(response, Response::TimeoutRequest(2100)));
     let response = device.handle_event(Event::TimeoutFired).unwrap(); // end Rx2
+    // Unacknowledged confirmed uplink: a random RETRANSMIT_TIMEOUT (1..=3 s)
+    // after the RX2 window (closed at t = 2100) before NoAck is reported
+    assert!(matches!(response, Response::TimeoutRequest(t) if (3100..=5100).contains(&t)));
+    let response = device.handle_event(Event::TimeoutFired).unwrap(); // retransmit timeout
     assert!(matches!(response, Response::NoAck));
 }
 

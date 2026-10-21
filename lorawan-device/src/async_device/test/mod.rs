@@ -21,6 +21,8 @@ mod certification;
 
 mod maccommands;
 
+mod nvm;
+
 #[cfg(feature = "class-c")]
 mod class_c;
 
@@ -292,14 +294,14 @@ async fn test_confirmed_uplink_no_ack_retransmission() {
         (async_device, response)
     });
 
-    for (rx1, rx2) in [(1, 2), (3, 4), (5, 6)] {
+    for (rx1, rx2, retransmit) in [(1, 2, 3), (4, 5, 6), (7, 8, 9)] {
         timer.fire_when_armed(rx1).await; // RX1 start
         radio.handle_timeout().await; // RX1 end
         timer.fire_when_armed(rx2).await; // RX2 start
         radio.handle_timeout().await; // RX2 end
+        timer.fire_when_armed(retransmit).await; // retransmit timeout
     }
 
-    // No confirmation after all NbTrans attempts
     let (mut device, response) = async_device.await.unwrap();
     match response {
         Ok(SendResponse::NoAck) => (),
@@ -332,6 +334,8 @@ async fn test_confirmed_uplink_no_ack() {
     assert!(!*send_await_complete.lock().await);
     // Trigger end of RX1
     radio.handle_timeout().await;
+    // Wait out the random RETRANSMIT_TIMEOUT before NoAck is reported
+    timer.fire_when_armed(3).await;
 
     match async_device.await.unwrap() {
         Ok(SendResponse::NoAck) => (),

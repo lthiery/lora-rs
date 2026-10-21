@@ -11,11 +11,12 @@ use radio_kind_params::*;
 use crate::mod_params::*;
 use crate::mod_traits::IrqState;
 use crate::{InterfaceVariant, RadioKind, SpiInterface};
+use lora_modulation::BaseBandModulationParams;
 mod variant;
 pub use variant::*;
 
 // Maximum number of registers that can be added to the retention list
-const MAX_NUMBER_REGS_IN_RETENTION: u8 = 4;
+const MAX_RETENTION_REGS: usize = 4;
 
 // Internal frequency of the radio
 const SX126X_XTAL_FREQ: u32 = 32000000;
@@ -81,9 +82,9 @@ where
 
     // Utility functions
     async fn add_register_to_retention_list(&mut self, register: Register) -> Result<(), RadioError> {
-        let mut buffer = [0x00u8; (1 + (2 * MAX_NUMBER_REGS_IN_RETENTION)) as usize];
+        let mut buffer = [0x00u8; 1 + 2 * MAX_RETENTION_REGS];
 
-        // Read the address and registers already added to the list
+        // Read existing retention list
         self.intf
             .read(
                 &[
@@ -96,19 +97,25 @@ where
             )
             .await?;
 
-        let number_of_registers = buffer[0];
+        let number_of_registers = buffer[0] as usize;
+
+        // Handle invalid read due to possible SPI bus issues
+        if number_of_registers > MAX_RETENTION_REGS {
+            return Err(RadioError::InvalidConfiguration);
+        }
+
+        // Check whether register is already present
         for i in 0..number_of_registers {
-            if register.addr1() == buffer[(1 + (2 * i)) as usize] && register.addr2() == buffer[(2 + (2 * i)) as usize]
-            {
-                return Ok(()); // register already in list
+            if register.addr1() == buffer[1 + 2 * i] && register.addr2() == buffer[2 + 2 * i] {
+                return Ok(());
             }
         }
 
-        if number_of_registers < MAX_NUMBER_REGS_IN_RETENTION {
-            buffer[0] += 1; // increment number of registers
+        if number_of_registers < MAX_RETENTION_REGS {
+            buffer[0] += 1;
 
-            buffer[(1 + (2 * number_of_registers)) as usize] = register.addr1();
-            buffer[(2 + (2 * number_of_registers)) as usize] = register.addr2();
+            buffer[1 + 2 * number_of_registers] = register.addr1();
+            buffer[2 + 2 * number_of_registers] = register.addr2();
 
             let register = [
                 OpCode::WriteRegister.value(),
@@ -318,13 +325,10 @@ where
             return Err(RadioError::InvalidBandwidthForFrequency);
         }
 
-        let mut low_data_rate_optimize = 0x00u8;
-        if (((spreading_factor == SpreadingFactor::_11) || (spreading_factor == SpreadingFactor::_12))
-            && (bandwidth == Bandwidth::_125KHz))
-            || ((spreading_factor == SpreadingFactor::_12) && (bandwidth == Bandwidth::_250KHz))
-        {
-            low_data_rate_optimize = 0x01u8;
-        }
+        let low_data_rate_optimize = u8::from(BaseBandModulationParams::low_data_rate_optimize(
+            spreading_factor,
+            bandwidth,
+        ));
         Ok(ModulationParams {
             spreading_factor,
             bandwidth,
@@ -675,10 +679,9 @@ where
         if OpStatusErrorMask::is_error(read_status) {
             return Err(RadioError::OpError(read_status));
         }
-        // check this ???
-        let rssi = ((-(pkt_status[0] as i32)) >> 1) as i16;
-        let snr = (((pkt_status[1] as i8) + 2) >> 2) as i16;
-        let _signal_rssi = ((-(pkt_status[2] as i32)) >> 1) as i16; // unused currently
+        // RssiPkt = -raw / 2 dBm, SnrPkt = raw (signed) / 4 dB
+        let rssi = Rssi::from_quarter_dbm(-2 * pkt_status[0] as i16);
+        let snr = Snr::from_quarter_db(pkt_status[1] as i8 as i16);
 
         Ok(PacketStatus { rssi, snr })
     }

@@ -19,7 +19,7 @@ use crate::LoRa;
 use crate::mod_params::{RadioMode, RxMode};
 use crate::mod_traits::RadioKind;
 use crate::sx127x::radio_kind_params::Register;
-use lora_modulation::{Bandwidth, CodingRate, SpreadingFactor};
+use lora_modulation::{Bandwidth, BaseBandModulationParams, CodingRate, SpreadingFactor};
 use smtc_modem_cores::sx127x::{Context, sx127x_radio_id_e};
 use smtc_modem_cores::sys;
 
@@ -72,16 +72,14 @@ async fn test_set_channel() {
 
 async fn compare_mod_params(sf: SpreadingFactor, c_sf: u32, bw: Bandwidth, c_bw: u32, cr: CodingRate, c_cr: u32) {
     let mut reference_radio = reference();
-    let ldro = match (sf, bw) {
-        // symbol duration > 16 ms
-        (SpreadingFactor::_12, Bandwidth::_125KHz) | (SpreadingFactor::_11, Bandwidth::_125KHz) => 1,
-        _ => 0,
-    };
+
     reference_radio.set_lora_mod_params(&sys::sx127x_lora_mod_params_t {
         sf: c_sf,
         bw: c_bw,
         cr: c_cr,
-        ldro,
+        // same source as the driver: this compares register encoding, the
+        // decision itself is covered by test_all_modulation_params_for_ldro
+        ldro: u8::from(BaseBandModulationParams::low_data_rate_optimize(sf, bw)),
     });
 
     // errata 2.3 registers: SWL2001 writes these on every SetRx, ours with
@@ -109,6 +107,18 @@ async fn test_set_modulation_params() {
         sys::sx127x_lora_cr_e_SX127X_LORA_CR_4_5,
     )
     .await;
+
+    // LDRO forced on: SF11/BW125 is the boundary case,
+    // its symbol duration is exactly 16.384ms
+    compare_mod_params(
+        SpreadingFactor::_11,
+        sys::sx127x_lora_sf_e_SX127X_LORA_SF11,
+        Bandwidth::_125KHz,
+        sys::sx127x_lora_bw_e_SX127X_LORA_BW_125,
+        CodingRate::_4_5,
+        sys::sx127x_lora_cr_e_SX127X_LORA_CR_4_5,
+    )
+    .await;
     // LDRO forced on
     compare_mod_params(
         SpreadingFactor::_12,
@@ -129,6 +139,42 @@ async fn test_set_modulation_params() {
         sys::sx127x_lora_cr_e_SX127X_LORA_CR_4_5,
     )
     .await;
+}
+
+#[test]
+fn test_all_modulation_params_for_ldro() {
+    // LDRO per (SF and BW), Semtech ral_compute_lora_ldro table, rows in SF6..SF12 order (SF5 unsupported)
+    let expected: [(SpreadingFactor, [u8; 10]); 7] = [
+        (SpreadingFactor::_6, [1, 1, 1, 1, 1, 0, 0, 0, 0, 0]),
+        (SpreadingFactor::_7, [1, 1, 1, 1, 1, 0, 0, 0, 0, 0]),
+        (SpreadingFactor::_8, [1, 1, 1, 1, 1, 0, 0, 0, 0, 0]),
+        (SpreadingFactor::_9, [1, 1, 1, 1, 1, 1, 0, 0, 0, 0]),
+        (SpreadingFactor::_10, [1, 1, 1, 1, 1, 1, 1, 0, 0, 0]),
+        (SpreadingFactor::_11, [1, 1, 1, 1, 1, 1, 1, 1, 0, 0]),
+        (SpreadingFactor::_12, [1, 1, 1, 1, 1, 1, 1, 1, 1, 0]),
+    ];
+    let bws = [
+        Bandwidth::_7KHz,
+        Bandwidth::_10KHz,
+        Bandwidth::_15KHz,
+        Bandwidth::_20KHz,
+        Bandwidth::_31KHz,
+        Bandwidth::_41KHz,
+        Bandwidth::_62KHz,
+        Bandwidth::_125KHz,
+        Bandwidth::_250KHz,
+        Bandwidth::_500KHz,
+    ];
+
+    let radio = get_sx1276();
+    for (sf, row) in expected {
+        for (bw, want) in bws.iter().zip(row) {
+            let params = radio
+                .create_modulation_params(sf, *bw, CodingRate::_4_5, 868_100_000)
+                .unwrap();
+            assert_eq!(params.low_data_rate_optimize, want, "ldro for {sf:?}/{bw:?}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -398,29 +444,37 @@ async fn test_get_rx_payload() {
 
 #[tokio::test]
 async fn test_packet_status_value_parity() {
-    // SNR -6 dB (raw = -24 as u8 = 0xE8), RSSI raw 60 @ 868.1 MHz (HF port)
-    let mut reference_radio = reference();
-    reference_radio.set_rf_freq(868_100_000);
-    reference_radio.spi_mut().set_reg(0x19, 0xE8); // RegPktSnrValue
-    reference_radio.spi_mut().set_reg(0x1A, 60); // RegPktRssiValue
-    let (_, c_status) = reference_radio.get_lora_pkt_status();
+    // RegPktSnrValue in 0.25 dB steps: 0xF9 = -1.75 dB, 0x0A = 2.5 dB, 0xE8 = -6 dB.
+    // The reference rounds SNR to nearest ((raw + 2) >> 2): -2, 3, -6. This
+    // crate used to truncate toward zero (raw / 4): -1, 2, -6.
+    for (raw_snr, quarter_db, db) in [(0xF9u8, -7i16, -2i16), (0x0A, 10, 3), (0xE8, -24, -6)] {
+        // RSSI raw 60 @ 868.1 MHz (HF port)
+        let mut reference_radio = reference();
+        reference_radio.set_rf_freq(868_100_000);
+        reference_radio.spi_mut().set_reg(0x19, raw_snr); // RegPktSnrValue
+        reference_radio.spi_mut().set_reg(0x1A, 60); // RegPktRssiValue
+        let (_, c_status) = reference_radio.get_lora_pkt_status();
 
-    let mut radio = get_sx1276();
-    radio.set_channel(868_100_000).await.unwrap();
-    radio.spi_mut().set_reg(0x19, 0xE8);
-    radio.spi_mut().set_reg(0x1A, 60);
-    let status = radio.get_rx_packet_status().await.unwrap();
+        let mut radio = get_sx1276();
+        radio.set_channel(868_100_000).await.unwrap();
+        radio.spi_mut().set_reg(0x19, raw_snr);
+        radio.spi_mut().set_reg(0x1A, 60);
+        let status = radio.get_rx_packet_status().await.unwrap();
 
-    assert_eq!(status.snr, c_status.snr_pkt_in_db as i16);
-    // both linearize the raw RSSI, with different integer approximations of
-    // the same 16/15 correction: ours rounds (raw * 16 + 7) / 15, the
-    // reference computes raw + (raw >> 4) — at most 1 dB apart
-    assert!(
-        (status.rssi - c_status.rssi_pkt_in_dbm as i16).abs() <= 1,
-        "rssi {} vs reference {}",
-        status.rssi,
-        c_status.rssi_pkt_in_dbm
-    );
+        assert_eq!(status.snr.quarter_db(), quarter_db);
+        assert_eq!(status.snr.db(), db);
+        assert_eq!(status.snr.db(), c_status.snr_pkt_in_db as i16, "snr raw {raw_snr:#04x}");
+        // both linearize the raw RSSI, with different integer approximations of
+        // the same 16/15 correction: ours rounds (raw * 64 + 7) / 15 in quarter
+        // dB, the reference computes raw + (raw >> 4) in whole dB. At most 1 dB
+        // apart
+        assert!(
+            (status.rssi.dbm() - c_status.rssi_pkt_in_dbm as i16).abs() <= 1,
+            "rssi {} vs reference {} (snr raw {raw_snr:#04x})",
+            status.rssi.dbm(),
+            c_status.rssi_pkt_in_dbm
+        );
+    }
 }
 
 #[tokio::test]
@@ -555,9 +609,12 @@ async fn test_emulated_rx_end_to_end() {
     let mut buf = [0u8; 255];
     let (len, status) = lora.rx(&rx_pkt_params, &mut buf).await.unwrap();
     assert_eq!(&buf[..len as usize], b"ping");
-    // HF port offset -157, raw 100 linearized by 16/15: -157 + 107
-    assert_eq!(status.rssi, -50);
-    assert_eq!(status.snr, 5);
+    // HF port offset -157, raw 100 linearized by 16/15: -157 + 106.67 = -50.33 dBm.
+    // Quarter dB: 4 * -157 + round(100 * 64 / 15) = -201; whole dBm rounds down
+    // to -51 (the whole-dB path used to round the 16/15 term first: -50)
+    assert_eq!(status.rssi.quarter_dbm(), -201);
+    assert_eq!(status.rssi.dbm(), -51);
+    assert_eq!(status.snr.db(), 5);
 }
 
 #[tokio::test]

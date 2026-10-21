@@ -11,9 +11,16 @@ use rand_core::RngCore;
 
 pub use crate::region::DR;
 use crate::{
+    nvm::{
+        DEFAULT_FCNT_CHECKPOINT_MARGIN, MAX_BLOB_LEN, NoNvm, NonVolatileStore, NvmRegion,
+        PersistentIdentity, PersistentSession,
+    },
     radio::{RadioBuffer, RfConfig, RxConfig},
     rng,
 };
+
+#[cfg(feature = "class-c")]
+use self::radio::RxQuality;
 
 pub mod radio;
 
@@ -61,11 +68,17 @@ use self::radio::RxStatus;
 /// that may be buffered. The defaults are 256 and 1 respectively which should be fine for Class A devices. **For Class
 /// C operation**, it is recommended to increase D to at least 2, if not 3. This is because during the RX1/RX2 windows
 /// after a Class A transmit, it is possible to receive Class C downlinks (in additional to any RX1/RX2 responses!).
-pub struct Device<R, T, G, const N: usize = 256, const D: usize = 1>
+///
+/// S is a user-supplied [`NonVolatileStore`], set via [`Device::restore`]. It enables LoRaWAN
+/// 1.0.4 behavior: monotonic DevNonce, JoinNonce replay protection and session resume across
+/// power loss. The default [`NoNvm`] keeps the stack at LoRaWAN 1.0.2 with no persistence
+/// code compiled in.
+pub struct Device<R, T, G, const N: usize = 256, const D: usize = 1, S = NoNvm>
 where
     R: radio::PhyRxTx + Timings,
     T: radio::Timer,
     G: RngCore,
+    S: NonVolatileStore,
 {
     radio: R,
     /// Access to provided (pseudo)-random number generator.
@@ -78,6 +91,7 @@ where
     /// bit and MAC commands) after the radio buffer is reused for reception.
     retransmit_buffer: RadioBuffer<N>,
     downlink: Vec<Downlink, D>,
+    nvm: Persistence<S>,
     #[cfg(feature = "class-c")]
     class_c: bool,
 }
@@ -87,6 +101,9 @@ where
 pub enum Error<R> {
     Radio(R),
     Mac(mac::Error),
+    /// The non-volatile store failed a save that must complete before the stack can
+    /// proceed (e.g. the DevNonce before a join request).
+    Nvm,
 }
 
 #[cfg_attr(feature = "defmt-03", derive(defmt::Format))]
@@ -170,7 +187,31 @@ where
     }
 }
 
-impl<R, T, G, const N: usize, const D: usize> Device<R, T, G, N, D>
+impl<R, T, const N: usize, const D: usize, S> Device<R, T, rng::Prng, N, D, S>
+where
+    R: radio::PhyRxTx + Timings,
+    T: radio::Timer,
+    S: NonVolatileStore,
+{
+    /// Create a [`Device`] backed by a non-volatile store, like [`restore`](Device::restore), but let
+    /// [`Device`] use an algorithmic PRNG seeded with `seed` instead of an external RNG.
+    ///
+    /// # ⚠️Warning⚠️
+    ///
+    /// This function must **always** be called with a new randomly generated seed! **Never** call this function more
+    /// than once using the same seed. Generate the seed using a true random number generator.
+    pub async fn restore_with_seed(
+        region: region::Configuration,
+        radio: R,
+        timer: T,
+        seed: u64,
+        store: S,
+    ) -> Result<Self, S::Error> {
+        Device::restore(region, radio, timer, rng::Prng::new(seed), store).await
+    }
+}
+
+impl<R, T, G, const N: usize, const D: usize> Device<R, T, G, N, D, NoNvm>
 where
     R: radio::PhyRxTx + Timings,
     T: radio::Timer,
@@ -205,9 +246,81 @@ where
             retransmit_buffer: RadioBuffer::new(),
             timer,
             downlink: Vec::new(),
+            nvm: Persistence::new(NoNvm, 0),
             #[cfg(feature = "class-c")]
             class_c: false,
         }
+    }
+}
+
+impl<R, T, G, const N: usize, const D: usize, S> Device<R, T, G, N, D, S>
+where
+    R: radio::PhyRxTx + Timings,
+    T: radio::Timer,
+    G: RngCore,
+    S: NonVolatileStore,
+{
+    /// Create a [`Device`] backed by a non-volatile store, restoring any persisted state.
+    /// This is the only constructor for LoRaWAN 1.0.4 operation.
+    ///
+    /// A missing or corrupt identity blob means fresh join counters. A session blob is
+    /// resumed only when intact and tied to the current identity epoch; otherwise it is
+    /// discarded and the identity counters are kept, so the next join still uses a
+    /// monotonic DevNonce.
+    ///
+    /// Only store access errors are returned; corruption falls back as described. A corrupt
+    /// identity blob restarts the DevNonce at 0, so stores must write that region
+    /// atomically. The region configuration must match the one the persisted state was
+    /// written under.
+    pub async fn restore(
+        region: region::Configuration,
+        radio: R,
+        timer: T,
+        rng: G,
+        mut store: S,
+    ) -> Result<Self, S::Error> {
+        let mut mac = Mac::new(region, R::MAX_RADIO_POWER, R::ANTENNA_GAIN);
+        let mut fcnt_up_checkpoint = 0;
+        if S::PERSISTENT {
+            let mut buf = [0u8; MAX_BLOB_LEN];
+            let identity = match store.load(NvmRegion::Identity, &mut buf).await? {
+                Some(n) => PersistentIdentity::decode(&buf[..n]).unwrap_or_default(),
+                None => PersistentIdentity::default(),
+            };
+            if let Some(n) = store.load(NvmRegion::Session, &mut buf).await?
+                && let Ok(ps) = PersistentSession::decode(&buf[..n])
+                && ps.join_epoch == identity.join_epoch
+            {
+                fcnt_up_checkpoint = ps.fcnt_up_checkpoint;
+                mac.restore_session(&ps);
+            }
+            mac.set_identity(identity);
+        }
+        Ok(Self {
+            radio,
+            rng,
+            mac,
+            radio_buffer: RadioBuffer::new(),
+            retransmit_buffer: RadioBuffer::new(),
+            timer,
+            downlink: Vec::new(),
+            nvm: Persistence::new(store, fcnt_up_checkpoint),
+            #[cfg(feature = "class-c")]
+            class_c: false,
+        })
+    }
+
+    /// Set how far ahead of the live uplink counter the persisted resume point is kept.
+    /// Higher values mean fewer flash writes but a larger counter skip per power cycle.
+    /// Defaults to [`DEFAULT_FCNT_CHECKPOINT_MARGIN`].
+    pub fn set_checkpoint_margin(&mut self, margin: u32) {
+        self.nvm.margin = margin.max(1);
+    }
+
+    /// Flush identity and session state to the store with the resume point set to the
+    /// exact live counter, e.g. before a planned power-down. No-op without a store.
+    pub async fn checkpoint(&mut self) -> Result<(), Error<R::PhyError>> {
+        self.nvm.checkpoint(&self.mac).await
     }
 
     /// Enables Class C behavior. Note that Class C downlinks are not possible until a confirmed
@@ -340,7 +453,11 @@ where
                     &mut self.rng,
                     NetworkCredentials::new(*appeui, *deveui, *appkey),
                     &mut self.radio_buffer,
-                );
+                )?;
+
+                // The DevNonce must be durable before the request goes on the air;
+                // a reset after transmit would otherwise reuse it.
+                self.nvm.persist_identity(&self.mac).await?;
 
                 // Transmit the join payload
                 let ms = self
@@ -351,10 +468,18 @@ where
 
                 // Receive join response within RX window
                 self.timer.reset();
-                Ok(self.rx_downlink(&Frame::Join, ms, &rx_windows).await?.into())
+                let response = self.rx_downlink(&Frame::Join, ms, &rx_windows).await?;
+                if matches!(response, mac::Response::JoinSuccess) {
+                    // Identity first (JoinNonce, epoch), then the fresh session.
+                    self.nvm.persist_identity(&self.mac).await?;
+                    self.nvm.new_session(&self.mac).await?;
+                }
+                Ok(response.into())
             }
             JoinMode::ABP { nwkskey, appskey, devaddr } => {
-                self.mac.join_abp(*nwkskey, *appskey, *devaddr);
+                if !self.mac.join_abp(*nwkskey, *appskey, *devaddr) {
+                    self.nvm.new_session(&self.mac).await?;
+                }
                 Ok(JoinResponse::JoinSuccess)
             }
         }
@@ -375,6 +500,11 @@ where
     /// transmits (such as certification answer frames on FPort 224), which are
     /// followed by RX windows like any other uplink.
     ///
+    /// After the last confirmed attempt, `send` waits `RETRANSMIT_TIMEOUT` before
+    /// returning `SendResponse::NoAck`. In Class C mode the wait is spent listening
+    /// for downlinks, so the device is not deaf during the wait. The next uplink can
+    /// start as soon as `send` returns.
+    ///
     /// In Class C mode, it is possible to get one or more downlinks and `Reponse::DownlinkReceived`
     /// maybe not even be indicated. It is recommended to call `take_downlink` after `send` until
     /// it returns `None`.
@@ -385,18 +515,20 @@ where
         confirmed: bool,
     ) -> Result<SendResponse, Error<R::PhyError>> {
         // Prepare transmission buffer
-        let (mut tx_config, mut rx_windows, _fcnt_up) = self.mac.send::<G, N>(
+        let (mut tx_config, mut rx_windows, fcnt_up) = self.mac.send::<G, N>(
             &mut self.rng,
             &mut self.radio_buffer,
             &SendData { data, fport, confirmed },
         )?;
+        self.nvm.before_uplink(&self.mac, fcnt_up).await?;
+        let fcnt_down = self.mac.get_fcnt_down();
         // Retain a copy of the built frame for potential NbTrans retransmissions
         self.retransmit_buffer.clear();
         self.retransmit_buffer.extend_from_slice(self.radio_buffer.as_ref_for_read()).unwrap();
 
         let mut ms = 0u32;
         let mut tx_pending = true;
-        loop {
+        let response = loop {
             if tx_pending {
                 // Transmit our data packet
                 ms = self
@@ -415,6 +547,21 @@ where
                     (tx_config, rx_windows) = self.mac.retransmit_config::<G>(&mut self.rng);
                     tx_pending = true;
                 }
+                // Every repetition of a confirmed frame waits RETRANSMIT_TIMEOUT.
+                mac::Response::RetransmitConfirmed => {
+                    let timeout_ms = mac::retransmit_timeout_ms(&mut self.rng);
+                    debug!(
+                        "Retransmitting confirmed frame; waiting {} ms before the next copy.",
+                        timeout_ms
+                    );
+                    // A downlink accepted during the wait (class C) ends the
+                    // retransmission cycle: the MAC has moved to the next FCntUp.
+                    if let Some(response) = self.retransmit_wait(timeout_ms).await? {
+                        break response;
+                    }
+                    (tx_config, rx_windows) = self.mac.retransmit_config::<G>(&mut self.rng);
+                    tx_pending = true;
+                }
                 // A certification answer was transmitted inside the RX window;
                 // it is a regular uplink, so run its RX windows (and NbTrans
                 // retransmissions) without transmitting again.
@@ -423,9 +570,24 @@ where
                     (ms, rx_windows) = self.mac.take_pending_cert_rx();
                     tx_pending = false;
                 }
-                response => return Ok(response.into()),
+                response => {
+                    // Wait for random RETRANSMIT_TIMEOUT before reporting a NoAck.
+                    if matches!(response, mac::Response::NoAck) {
+                        let timeout_ms = mac::retransmit_timeout_ms(&mut self.rng);
+                        debug!(
+                            "No ACK received; waiting {} ms before the next uplink.",
+                            timeout_ms
+                        );
+                        if let Some(response) = self.retransmit_wait(timeout_ms).await? {
+                            break response;
+                        }
+                    }
+                    break response;
+                }
             }
-        }
+        };
+        self.nvm.after_downlink(&self.mac, fcnt_down).await?;
+        Ok(response.into())
     }
 
     /// Take the downlink data from the device. This is typically called after a
@@ -460,48 +622,12 @@ where
         &mut self,
         duration: u32,
     ) -> Result<Option<mac::Response>, Error<R::PhyError>> {
-        use self::radio::RxQuality;
-        use futures::{future::Either, future::select, pin_mut};
+        use futures::pin_mut;
 
         if !self.class_c {
             self.radio.warm_sleep().await.map_err(Error::Radio)?;
             self.timer.at(duration.into()).await;
             return Ok(None);
-        }
-
-        #[allow(unused)]
-        enum RxcWindowResponse<F: futures::Future<Output = ()> + Sized + Unpin> {
-            Rx(usize, RxQuality, F),
-            Timeout(u32),
-        }
-
-        /// RXC window listen until timeout
-        async fn rxc_listen_until_timeout<F, R, const N: usize>(
-            radio: &mut R,
-            rx_buf: &mut RadioBuffer<N>,
-            window_duration: u32,
-            timeout_fut: F,
-        ) -> RxcWindowResponse<F>
-        where
-            F: futures::Future<Output = ()> + Sized + Unpin,
-            R: radio::PhyRxTx + Timings,
-        {
-            let rx_fut = radio.rx_continuous(rx_buf.as_mut());
-            pin_mut!(rx_fut);
-            // Wait until either a RF frame is received or the timeout future fires
-            match select(rx_fut, timeout_fut).await {
-                Either::Left((r, timeout_fut)) => match r {
-                    Ok((sz, q)) => RxcWindowResponse::Rx(sz, q, timeout_fut),
-                    // Ignore errors or timeouts and wait until the RX2 window is ready.
-                    // Setting timeout to 0 ensures that `window_duration != rx2_start_delay`
-                    _ => {
-                        timeout_fut.await;
-                        RxcWindowResponse::Timeout(0)
-                    }
-                },
-                // Timeout! Prepare for the next window.
-                Either::Right(_) => RxcWindowResponse::Timeout(window_duration),
-            }
         }
 
         // Class C listen while waiting for the window
@@ -538,6 +664,7 @@ where
                         &mut self.mac,
                         &mut self.radio,
                         &mut self.rng,
+                        &mut self.nvm,
                         mac_response,
                         Some(rx_config),
                     )
@@ -565,6 +692,63 @@ where
             }
         }
         Ok(response)
+    }
+
+    /// Wait out a RETRANSMIT_TIMEOUT. A class C device listens in RXC during
+    /// the wait (the radio must already be in RXC, see `window_complete`) and
+    /// returns early with the response of an accepted downlink.
+    async fn retransmit_wait(
+        &mut self,
+        timeout_ms: u32,
+    ) -> Result<Option<mac::Response>, Error<R::PhyError>> {
+        #[cfg(feature = "class-c")]
+        if self.class_c {
+            use futures::pin_mut;
+            let rx_config = self.mac.get_rxc_config();
+            let timeout_fut = self.timer.delay_ms(u64::from(timeout_ms));
+            pin_mut!(timeout_fut);
+            let mut maybe_timeout_fut = Some(timeout_fut);
+            while let Some(timeout_fut) = maybe_timeout_fut.take() {
+                match rxc_listen_until_timeout(
+                    &mut self.radio,
+                    &mut self.radio_buffer,
+                    timeout_ms,
+                    timeout_fut,
+                )
+                .await
+                {
+                    RxcWindowResponse::Rx(sz, q, timeout_fut) => {
+                        debug!("RXC window received {} bytes.", sz);
+                        self.radio_buffer.set_pos(sz);
+                        let mac_response = self.mac.handle_rxc::<N, D>(
+                            &mut self.radio_buffer,
+                            &mut self.downlink,
+                            q.snr(),
+                            &rx_config.rf,
+                        )?;
+                        if let Some(response) = Self::handle_mac_response(
+                            &mut self.radio_buffer,
+                            &mut self.retransmit_buffer,
+                            &mut self.mac,
+                            &mut self.radio,
+                            &mut self.rng,
+                            &mut self.nvm,
+                            mac_response,
+                            Some(rx_config),
+                        )
+                        .await?
+                        {
+                            return Ok(Some(response));
+                        }
+                        maybe_timeout_fut = Some(timeout_fut);
+                    }
+                    RxcWindowResponse::Timeout(_) => break,
+                }
+            }
+            return Ok(None);
+        }
+        self.timer.delay_ms(u64::from(timeout_ms)).await;
+        Ok(None)
     }
 
     /// Attempt to receive data within RX1 and RX2 windows. This function will populate the
@@ -635,13 +819,15 @@ where
     }
 
     /// Helper function to handle MAC responses and perform common actions
-    #[allow(unused_variables)]
+    // Split borrows: the Class C listen loop holds a timer future across this call.
+    #[allow(unused_variables, clippy::too_many_arguments)]
     async fn handle_mac_response(
         radio_buffer: &mut RadioBuffer<N>,
         retransmit_buffer: &mut RadioBuffer<N>,
         mac: &mut Mac,
         radio: &mut R,
         rng: &mut G,
+        nvm: &mut Persistence<S>,
         response: mac::Response,
         rx_config: Option<RxConfig>,
     ) -> Result<Option<mac::Response>, Error<R::PhyError>> {
@@ -655,8 +841,9 @@ where
             }
             #[cfg(feature = "certification")]
             mac::Response::UplinkPrepared => {
-                let (tx_config, rx_windows, _fcnt_up) =
+                let (tx_config, rx_windows, fcnt_up) =
                     mac.certification_setup_send::<G, N>(rng, radio_buffer)?;
+                nvm.before_uplink(mac, fcnt_up).await?;
                 // The answer is a regular uplink: retain it so the send loop
                 // can retransmit it per NbTrans (the radio buffer is reused
                 // for reception).
@@ -677,8 +864,9 @@ where
             #[cfg(feature = "multicast")]
             mac::Response::Multicast(mut response) => {
                 if response.is_transmit_request() {
-                    let (tx_config, _fcnt_up) =
+                    let (tx_config, fcnt_up) =
                         mac.multicast_setup_send::<G, N>(rng, radio_buffer)?;
+                    nvm.before_uplink(mac, fcnt_up).await?;
                     radio
                         .tx(tx_config, radio_buffer.as_ref_for_read())
                         .await
@@ -721,6 +909,7 @@ where
                         &mut self.mac,
                         &mut self.radio,
                         &mut self.rng,
+                        &mut self.nvm,
                         mac_response,
                         None,
                     )
@@ -740,6 +929,7 @@ where
             let (sz, q) =
                 self.radio.rx_continuous(self.radio_buffer.as_mut()).await.map_err(Error::Radio)?;
             self.radio_buffer.set_pos(sz);
+            let fcnt_down = self.mac.get_fcnt_down();
             let mac_response = self.mac.handle_rxc::<N, D>(
                 &mut self.radio_buffer,
                 &mut self.downlink,
@@ -752,14 +942,110 @@ where
                 &mut self.mac,
                 &mut self.radio,
                 &mut self.rng,
+                &mut self.nvm,
                 mac_response,
                 Some(rx_config),
             )
             .await?
             {
+                self.nvm.after_downlink(&self.mac, fcnt_down).await?;
                 return Ok(response.into());
             }
         }
+    }
+}
+
+/// The store plus the checkpoint policy that decides when the session blob is rewritten.
+/// Every method is a no-op for [`NoNvm`].
+struct Persistence<S> {
+    store: S,
+    /// Persisted FCntUp resume point. The session blob is rewritten before transmitting
+    /// an uplink whose counter reaches this value.
+    fcnt_up_checkpoint: u32,
+    margin: u32,
+}
+
+impl<S: NonVolatileStore> Persistence<S> {
+    fn new(store: S, fcnt_up_checkpoint: u32) -> Self {
+        Self { store, fcnt_up_checkpoint, margin: DEFAULT_FCNT_CHECKPOINT_MARGIN }
+    }
+
+    /// Save a blob unless the store already holds identical bytes, sparing flash wear when
+    /// nothing changed.
+    async fn save_dedup<RE>(&mut self, region: NvmRegion, blob: &[u8]) -> Result<(), Error<RE>> {
+        let mut current = [0u8; MAX_BLOB_LEN];
+        if let Ok(Some(n)) = self.store.load(region, &mut current).await
+            && current[..n] == *blob
+        {
+            return Ok(());
+        }
+        self.store.save(region, blob).await.map_err(|_| {
+            warn!("nvm: saving {} failed", region);
+            Error::Nvm
+        })
+    }
+
+    async fn persist_identity<RE>(&mut self, mac: &Mac) -> Result<(), Error<RE>> {
+        if S::PERSISTENT
+            && let Some(identity) = mac.identity()
+        {
+            let mut buf = [0u8; MAX_BLOB_LEN];
+            let len = identity.encode(&mut buf);
+            self.save_dedup(NvmRegion::Identity, &buf[..len]).await?;
+        }
+        Ok(())
+    }
+
+    async fn persist_session<RE>(&mut self, mac: &Mac) -> Result<(), Error<RE>> {
+        if S::PERSISTENT
+            && let Some(session) = mac.snapshot_session(self.fcnt_up_checkpoint)
+        {
+            let mut buf = [0u8; MAX_BLOB_LEN];
+            let len = session.encode(&mut buf);
+            self.save_dedup(NvmRegion::Session, &buf[..len]).await?;
+        }
+        Ok(())
+    }
+
+    /// A session just started at FCntUp 0: persist it with its first checkpoint.
+    async fn new_session<RE>(&mut self, mac: &Mac) -> Result<(), Error<RE>> {
+        self.fcnt_up_checkpoint = self.margin;
+        self.persist_session(mac).await
+    }
+
+    /// Keep the checkpoint strictly ahead of every counter that goes on the air; a
+    /// reboot resumes from it.
+    async fn before_uplink<RE>(&mut self, mac: &Mac, fcnt_up: u32) -> Result<(), Error<RE>> {
+        if S::PERSISTENT && fcnt_up >= self.fcnt_up_checkpoint {
+            self.fcnt_up_checkpoint = fcnt_up + self.margin;
+            self.persist_session(mac).await?;
+        }
+        Ok(())
+    }
+
+    /// An accepted downlink advanced FCntDown and may have changed MAC state; both must
+    /// survive a reboot. `fcnt_down` is the counter before the receive window opened.
+    async fn after_downlink<RE>(
+        &mut self,
+        mac: &Mac,
+        fcnt_down: Option<u32>,
+    ) -> Result<(), Error<RE>> {
+        if S::PERSISTENT && mac.get_fcnt_down() != fcnt_down {
+            self.persist_session(mac).await?;
+        }
+        Ok(())
+    }
+
+    /// Flush everything with the resume point at the exact live counter.
+    async fn checkpoint<RE>(&mut self, mac: &Mac) -> Result<(), Error<RE>> {
+        if S::PERSISTENT {
+            if let Some(fcnt_up) = mac.get_fcnt_up() {
+                self.fcnt_up_checkpoint = fcnt_up;
+            }
+            self.persist_identity(mac).await?;
+            self.persist_session(mac).await?;
+        }
+        Ok(())
     }
 }
 
@@ -798,6 +1084,44 @@ pub trait Timings {
             timeout_symbols: PREAMBLE_SYMBOLS
                 .saturating_add(rf.bb.delay_in_symbols_ceil(self.get_rx_window_buffer())),
         }
+    }
+}
+
+/// Outcome of listening in RXC until a frame arrives or the timeout fires.
+#[cfg(feature = "class-c")]
+#[allow(unused)]
+enum RxcWindowResponse<F: futures::Future<Output = ()> + Sized + Unpin> {
+    Rx(usize, RxQuality, F),
+    Timeout(u32),
+}
+
+/// Listen in RXC until `timeout_fut` fires.
+#[cfg(feature = "class-c")]
+async fn rxc_listen_until_timeout<F, R, const N: usize>(
+    radio: &mut R,
+    rx_buf: &mut RadioBuffer<N>,
+    window_duration: u32,
+    timeout_fut: F,
+) -> RxcWindowResponse<F>
+where
+    F: futures::Future<Output = ()> + Sized + Unpin,
+    R: radio::PhyRxTx + Timings,
+{
+    use futures::{future::Either, future::select, pin_mut};
+    let rx_fut = radio.rx_continuous(rx_buf.as_mut());
+    pin_mut!(rx_fut);
+    // Wait for a frame or the timeout.
+    match select(rx_fut, timeout_fut).await {
+        Either::Left((r, timeout_fut)) => match r {
+            Ok((sz, q)) => RxcWindowResponse::Rx(sz, q, timeout_fut),
+            // Ignore receive errors and wait for the timeout.
+            _ => {
+                timeout_fut.await;
+                RxcWindowResponse::Timeout(0)
+            }
+        },
+        // Timeout fired.
+        Either::Right(_) => RxcWindowResponse::Timeout(window_duration),
     }
 }
 

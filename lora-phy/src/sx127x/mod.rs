@@ -13,6 +13,7 @@ use radio_kind_params::*;
 use crate::mod_params::*;
 use crate::mod_traits::IrqState;
 use crate::{InterfaceVariant, RadioKind, SpiInterface};
+use lora_modulation::BaseBandModulationParams;
 
 // TCXO flag
 const TCXO_FOR_OSCILLATOR: u8 = 0x10u8;
@@ -41,12 +42,12 @@ fn pll_step_to_freq(pll_step: u32) -> u32 {
 
 // RSSI requires linearization when SNR >= 0
 // Section 3.5.5 - Note 3
-fn linearize_rssi(rssi: u8) -> i16 {
-    // Integer approximation for RSSI * 16.0 / 15.0
+fn linearize_rssi_quarter(rssi: u8) -> i16 {
+    // Integer approximation for RSSI * 16.0 / 15.0, in units of 0.25 dB
     // General formula for integer division with rounding:
     // x / d == floor((x + floor(d / 2)) / d), when d > 0
     const DIVISOR: i16 = 15;
-    (rssi as i16 * 16 + (DIVISOR / 2)) / DIVISOR
+    (rssi as i16 * 64 + (DIVISOR / 2)) / DIVISOR
 }
 
 /// Configuration for SX127x-based boards
@@ -185,12 +186,10 @@ where
         }
 
         // Section 4.1.1.5 and 4.1.1.6
-        let bw_in_hz = u32::from(bandwidth);
-        let symbol_duration = 1000 / (bw_in_hz / (0x01u32 << spreading_factor_value(spreading_factor)?));
-        let mut low_data_rate_optimize = 0x00u8;
-        if symbol_duration > 16 {
-            low_data_rate_optimize = 0x01u8
-        }
+        let low_data_rate_optimize = u8::from(BaseBandModulationParams::low_data_rate_optimize(
+            spreading_factor,
+            bandwidth,
+        ));
 
         Ok(ModulationParams {
             spreading_factor,
@@ -306,8 +305,8 @@ where
         let val = (reg_val & 0b1111_1000) | opt;
         self.write_register(Register::RegDetectionOptimize, val).await?;
         self.write_register(Register::RegDetectionThreshold, thr).await?;
-        // Spreading Factor, Bandwidth, codingrate, ldro
 
+        // Spreading Factor, Bandwidth, codingrate, ldro
         C::set_modulation_params(self, mdltn_params).await?;
 
         Ok(())
@@ -433,27 +432,22 @@ where
     }
 
     async fn get_rx_packet_status(&mut self) -> Result<PacketStatus, RadioError> {
-        let snr = {
-            let packet_snr = self.read_register(Register::RegPktSnrValue).await?;
-            packet_snr as i8 as i16 / 4
-        };
+        // RegPktSnrValue: SNR in 0.25 dB steps, two's complement
+        let snr_quarter_db = self.read_register(Register::RegPktSnrValue).await? as i8 as i16;
+        let packet_rssi = self.read_register(Register::RegPktRssiValue).await?;
+        let rssi_offset = C::rssi_offset(self).await?;
 
-        let rssi = {
-            let packet_rssi = self.read_register(Register::RegPktRssiValue).await?;
+        // Section 5.5.5: the 16/15 linearization applies to the raw packet
+        // RSSI in both branches (the reference driver and LoRaMac-node agree;
+        // only the negative-SNR term differs). Computed in 0.25 dB units, so
+        // the SNR term keeps its quarter-dB steps below 0 dB.
+        let snr_term = if snr_quarter_db < 0 { snr_quarter_db } else { 0 };
+        let rssi_quarter_dbm = 4 * rssi_offset + linearize_rssi_quarter(packet_rssi) + snr_term;
 
-            let rssi_offset = C::rssi_offset(self).await?;
-
-            // Section 5.5.5: the 16/15 linearization applies to the raw
-            // packet RSSI in both branches (the reference driver and
-            // LoRaMac-node agree; only the negative-SNR term differs)
-            if snr >= 0 {
-                rssi_offset + linearize_rssi(packet_rssi)
-            } else {
-                rssi_offset + linearize_rssi(packet_rssi) + snr
-            }
-        };
-
-        Ok(PacketStatus { rssi, snr })
+        Ok(PacketStatus {
+            rssi: Rssi::from_quarter_dbm(rssi_quarter_dbm),
+            snr: Snr::from_quarter_db(snr_quarter_db),
+        })
     }
 
     async fn get_rssi(&mut self) -> Result<i16, RadioError> {
@@ -655,13 +649,14 @@ mod tests {
 
     #[test]
     fn test_rssi_linearization() {
-        const DELTA: f32 = 0.5;
+        // rounded to the nearest 0.25 dB, so never more than 0.125 dB off
+        const DELTA: f32 = 0.125;
         for offset in [SX1272_RSSI_OFFSET, SX1276_RSSI_OFFSET_LF, SX1276_RSSI_OFFSET_HF] {
             for rssi in 0..=u8::MAX {
                 let float_rssi = offset as f32 + rssi as f32 * 16.0 / 15.0;
-                let approx_rssi = offset + linearize_rssi(rssi);
-                let error = float_rssi - approx_rssi as f32;
-                assert!(error.abs() < DELTA);
+                let approx_rssi = (4 * offset + linearize_rssi_quarter(rssi)) as f32 / 4.0;
+                let error = float_rssi - approx_rssi;
+                assert!(error.abs() <= DELTA, "rssi {rssi}: {approx_rssi} vs {float_rssi}");
             }
         }
     }
