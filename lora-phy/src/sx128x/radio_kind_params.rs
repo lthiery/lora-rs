@@ -4,12 +4,13 @@ use crate::mod_params::*;
 /// the SX1281 only lacks the ranging engine.
 pub trait Sx128xVariant {}
 
-#[allow(dead_code, non_camel_case_types)]
+/// Table 11-23: time base of the SetTx/SetRx timeouts
+#[allow(dead_code)]
 pub enum PeriodBase {
     _15_625us = 0x00,
     _62_5us = 0x01,
     _1ms = 0x02,
-    _4_ms = 0x03,
+    _4ms = 0x03,
 }
 
 #[derive(Clone, Copy)]

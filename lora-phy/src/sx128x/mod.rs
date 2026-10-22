@@ -14,9 +14,6 @@ use crate::mod_params::*;
 use crate::mod_traits::IrqState;
 use crate::{InterfaceVariant, RadioKind, SpiInterface};
 
-// Limits for preamble detection window in single reception mode
-const SX128X_MAX_LORA_SYMB_NUM_TIMEOUT: u16 = 1023;
-
 // SWL2001 sx128x_regs.h: "the blob that must be written after wakeup to fix
 // the rssi is 0 after a sleep bug"
 const RSSI_SNR_BUGFIX_BLOB: [u8; 4] = [0x00, 0xAD, 0x08, 0x9A];
@@ -127,14 +124,11 @@ where
     IV: InterfaceVariant,
     C: Sx128xVariant,
 {
-    // The sx128x drives its single-receive timeout off SymbTimeout, which
-    // needs headroom over the 8-symbol LoRaWAN preamble to latch reliably; 6
-    // (the trait default) is too short and drops downlinks at higher rates.
-    const DEFAULT_MIN_RX_SYMBOLS: u16 = 8;
-
-    // RegSymbTimeout is 10 bits and there is no wall-clock RX timer to fall
-    // back on, so longer windows clamp (SUPPORTS_TIMED_SINGLE_RX stays false).
-    const MAX_SINGLE_RX_SYMBOLS: u16 = SX128X_MAX_LORA_SYMB_NUM_TIMEOUT;
+    // No symbol-count timeout on this chip (SWL2001's RAL reports it
+    // unsupported), so every single-shot window is a wall-clock SetRx
+    // timeout; a zero ceiling routes them all through RxMode::SingleMs.
+    const MAX_SINGLE_RX_SYMBOLS: u16 = 0;
+    const SUPPORTS_TIMED_SINGLE_RX: bool = true;
 
     async fn init_lora(&mut self, sync_word: u16) -> Result<(), RadioError> {
         let mut write_buffer = [0; 16];
@@ -355,11 +349,13 @@ where
     async fn do_rx(&mut self, rx_mode: RxMode) -> Result<(), RadioError> {
         self.set_tx_rx_buffer_base_address(0, 0).await?;
         self.clear_irq_status().await?;
+        // Table 11-23, same choices as ral_sx128x_set_rx; 0xFFFF on the
+        // 1 ms base is continuous, longer windows move to the 4 ms base
         let (period_base, period_base_count) = match rx_mode {
-            RxMode::Single(timeout) => (PeriodBase::_15_625us, timeout),
-            RxMode::SingleMs(ms) => (PeriodBase::_1ms, ms as u16),
             RxMode::Continuous => (PeriodBase::_1ms, 0xFFFF),
-            RxMode::DutyCycle(_duty_cycle_params) => return Err(RadioError::InvalidConfiguration),
+            RxMode::SingleMs(ms) if ms < 0xFFFF => (PeriodBase::_1ms, ms as u16),
+            RxMode::SingleMs(ms) => (PeriodBase::_4ms, (ms >> 2).min(0xFFFE) as u16),
+            RxMode::Single(_) | RxMode::DutyCycle(_) => return Err(RadioError::InvalidRadioMode),
         };
         let pbb = period_base_count.to_be_bytes();
         let buffer = [OpCode::SetRx as u8, period_base as u8, pbb[0], pbb[1]];

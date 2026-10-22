@@ -273,15 +273,22 @@ async fn test_do_rx() {
     // ral_sx128x_set_rx: 1 ms tick base, 0xFFFF for continuous, else the
     // window in ms. The chip has no symbol-count timeout, so RxMode::Single
     // cannot be expressed natively (see SUPPORTS_TIMED_SINGLE_RX).
+    use sx128x_tick_size_e::*;
     let cases = [
-        ("continuous", RxMode::Continuous, 0xFFFF),
-        ("single_72ms", RxMode::SingleMs(72), 72),
+        ("continuous", RxMode::Continuous, SX128X_TICK_SIZE_1000_US, 0xFFFF),
+        ("single_72ms", RxMode::SingleMs(72), SX128X_TICK_SIZE_1000_US, 72),
+        (
+            "single_100s",
+            RxMode::SingleMs(100_000),
+            SX128X_TICK_SIZE_4000_US,
+            25_000,
+        ),
     ];
-    for (label, mode, count) in cases {
+    for (label, mode, tick, count) in cases {
         let mut reference = reference();
         reference.set_buffer_base_address(0, 0);
         reference.clear_irq_status(0xFFFF);
-        reference.set_rx(sx128x_tick_size_e::SX128X_TICK_SIZE_1000_US, count);
+        reference.set_rx(tick, count);
 
         let mut radio = get_sx1280();
         radio.do_rx(mode).await.unwrap();
