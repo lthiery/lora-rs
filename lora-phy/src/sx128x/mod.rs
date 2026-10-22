@@ -350,8 +350,8 @@ where
 
     async fn do_tx(&mut self) -> Result<(), RadioError> {
         self.intf.iv.enable_rf_switch_tx().await?;
-        // Table 11-22, no timeout
-        let write_buffer = [OpCode::SetTx as u8, 0, 0, 0];
+        // Table 11-22: no timeout; the 1 ms base matches ral_sx128x_set_tx
+        let write_buffer = [OpCode::SetTx as u8, PeriodBase::_1ms as u8, 0, 0];
         self.intf.write(&write_buffer, false).await
     }
 
