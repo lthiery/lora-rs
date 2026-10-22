@@ -414,58 +414,43 @@ where
     }
 
     async fn do_cad(&mut self, _mdltn_params: &ModulationParams) -> Result<(), RadioError> {
-        todo!();
+        self.intf.iv.enable_rf_switch_rx().await?;
+        // Table 11-56: more symbols means fewer false detections at the cost
+        // of a longer scan; 8 is the usual middle ground
+        self.intf
+            .write(&[OpCode::SetCadParams as u8, CadSymbolNum::_8 as u8], false)
+            .await?;
+        self.intf.write(&[OpCode::SetCad as u8], false).await
     }
 
-    // Set the IRQ mask to disable unwanted interrupts,
-    // enable interrupts on DIO pins (sx128x has multiple),
-    // and allow interrupts.
+    // Enable the interrupts the mode needs and route them to DIO1
     async fn set_irq_params(&mut self, radio_mode: Option<RadioMode>) -> Result<(), RadioError> {
-        debug!("sx128x::set_irq_params");
         self.clear_irq_status().await?;
-        if let Some(radio_mode) = radio_mode {
-            match radio_mode {
-                RadioMode::Sleep | RadioMode::Standby => {
-                    let buffer = irq_dio1_buffer_from_params(0, 0, 0, 0);
-                    self.intf.write(&buffer, false).await?
-                }
-                RadioMode::FrequencySynthesis => todo!(),
-                RadioMode::Transmit => {
-                    // Taken from RadioLib
-                    let irq_mask = IrqMask::TxDone.value()
-                        | IrqMask::RxDone.value()
-                        | IrqMask::SyncWordValid.value()
-                        | IrqMask::SyncWordError.value()
-                        | IrqMask::CrcError.value();
-                    let dio1_mask = IrqMask::TxDone.value() | IrqMask::RxDone.value();
-                    let dio2_mask: u16 = 0;
-                    let dio3_mask: u16 = 0;
-                    let buffer = irq_dio1_buffer_from_params(irq_mask, dio1_mask, dio2_mask, dio3_mask);
-                    self.intf.write(&buffer, false).await?
-                }
-                RadioMode::Receive(rx_mode) => match rx_mode {
-                    RxMode::Single(_) => todo!(),
-                    RxMode::SingleMs(_) => todo!(),
-                    RxMode::Continuous => {
-                        // Taken from RadioLib
-                        let irq_mask = IrqMask::RxDone.value()
-                            | IrqMask::HeaderValid.value()
-                            | IrqMask::HeaderError.value()
-                            | IrqMask::CrcError.value()
-                            | IrqMask::RxTxTimeout.value();
-                        let dio1_mask = IrqMask::RxDone.value() | IrqMask::RxTxTimeout.value();
-                        let dio2_mask: u16 = 0;
-                        let dio3_mask: u16 = 0;
-                        let buffer = irq_dio1_buffer_from_params(irq_mask, dio1_mask, dio2_mask, dio3_mask);
-                        self.intf.write(&buffer, false).await?
-                    }
-                    RxMode::DutyCycle(_duty_cycle_params) => todo!(),
-                },
-                RadioMode::Listen => todo!(),
-                RadioMode::ChannelActivityDetection => todo!(),
+        let (irq_mask, dio1_mask) = match radio_mode {
+            Some(RadioMode::Transmit) => (
+                IrqMask::TxDone.value()
+                    | IrqMask::RxDone.value()
+                    | IrqMask::SyncWordValid.value()
+                    | IrqMask::SyncWordError.value()
+                    | IrqMask::CrcError.value(),
+                IrqMask::TxDone.value() | IrqMask::RxDone.value(),
+            ),
+            Some(RadioMode::Receive(_)) => (
+                IrqMask::RxDone.value()
+                    | IrqMask::HeaderValid.value()
+                    | IrqMask::HeaderError.value()
+                    | IrqMask::CrcError.value()
+                    | IrqMask::RxTxTimeout.value(),
+                IrqMask::RxDone.value() | IrqMask::RxTxTimeout.value(),
+            ),
+            Some(RadioMode::ChannelActivityDetection) => {
+                let mask = IrqMask::CadDone.value() | IrqMask::CadDetected.value();
+                (mask, mask)
             }
-        }
-        Ok(())
+            _ => (IrqMask::None.value(), IrqMask::None.value()),
+        };
+        let buffer = irq_dio1_buffer_from_params(irq_mask, dio1_mask, 0, 0);
+        self.intf.write(&buffer, false).await
     }
 
     async fn await_irq(&mut self) -> Result<(), RadioError> {
@@ -484,11 +469,11 @@ where
         let irq_flags = u16::from_be_bytes(read_buffer);
         match radio_mode {
             RadioMode::Receive(RxMode::Continuous | RxMode::Single(_) | RxMode::SingleMs(_)) => {
-                if (irq_flags & IrqMask::RxDone.value()) == IrqMask::RxDone.value() {
+                if IrqMask::RxDone.is_set_in(irq_flags) {
                     debug!("RxDone in radio mode {}", radio_mode);
                     return Ok(Some(IrqState::Done));
                 }
-                if (irq_flags & IrqMask::RxTxTimeout.value()) == IrqMask::RxTxTimeout.value() {
+                if IrqMask::RxTxTimeout.is_set_in(irq_flags) {
                     debug!("RxTxTimeout in radio mode {}", radio_mode);
                     return Err(RadioError::ReceiveTimeout);
                 }
@@ -498,12 +483,25 @@ where
                 }
             }
             RadioMode::Transmit => {
-                if (irq_flags & IrqMask::TxDone.value()) == IrqMask::TxDone.value() {
+                if IrqMask::TxDone.is_set_in(irq_flags) {
                     debug!("TxDone in radio mode {}", radio_mode);
                     return Ok(Some(IrqState::Done));
                 }
             }
-            e => warn!("Unknown radio mode: {:?}!", e),
+            RadioMode::ChannelActivityDetection => {
+                if IrqMask::CadDone.is_set_in(irq_flags) {
+                    if let Some(detected) = cad_activity_detected {
+                        *detected = IrqMask::CadDetected.is_set_in(irq_flags);
+                    }
+                    return Ok(Some(IrqState::Done));
+                }
+            }
+            RadioMode::Sleep | RadioMode::Standby | RadioMode::Listen => {
+                warn!("IRQ during sleep/standby/listen?");
+            }
+            RadioMode::FrequencySynthesis | RadioMode::Receive(RxMode::DutyCycle(_)) => {
+                return Err(RadioError::InvalidRadioMode);
+            }
         }
 
         // If no specific IRQ condition is met, return None

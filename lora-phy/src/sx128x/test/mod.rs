@@ -12,9 +12,10 @@ use crate::mod_params::{RadioMode, RxMode};
 use crate::mod_traits::{IrqState, RadioKind};
 use lora_modulation::{Bandwidth, CodingRate, SpreadingFactor};
 use smtc_modem_cores::sx128x::{
-    Context, sx128x_lora_ranging_bw_e, sx128x_lora_ranging_cr_e, sx128x_lora_ranging_pkt_len_modes_e,
-    sx128x_lora_ranging_preamble_len_t, sx128x_lora_ranging_sf_e, sx128x_mod_params_lora_t, sx128x_pkt_params_lora_t,
-    sx128x_pkt_type_e, sx128x_ramp_time_e, sx128x_reg_mod_e, sx128x_standby_cfg_e, sx128x_tick_size_e,
+    Context, sx128x_lora_cad_params_t, sx128x_lora_cad_symbs_e, sx128x_lora_ranging_bw_e, sx128x_lora_ranging_cr_e,
+    sx128x_lora_ranging_pkt_len_modes_e, sx128x_lora_ranging_preamble_len_t, sx128x_lora_ranging_sf_e,
+    sx128x_mod_params_lora_t, sx128x_pkt_params_lora_t, sx128x_pkt_type_e, sx128x_ramp_time_e, sx128x_reg_mod_e,
+    sx128x_standby_cfg_e, sx128x_tick_size_e,
 };
 
 const TEST_FREQ_HZ: u32 = 2_450_000_000;
@@ -298,6 +299,7 @@ async fn test_dio_irq_params() {
     let cases = [
         ("transmit", RadioMode::Transmit, 0x004Fu16, 0x0003u16),
         ("receive", RadioMode::Receive(RxMode::Continuous), 0x4072, 0x4002),
+        ("cad", RadioMode::ChannelActivityDetection, 0x3000, 0x3000),
     ];
     for (label, mode, irq_mask, dio1_mask) in cases {
         let mut reference = reference();
@@ -307,6 +309,32 @@ async fn test_dio_irq_params() {
         radio.set_irq_params(Some(mode)).await.unwrap();
         assert_eq!(radio.take_spi(), reference.inner, "{label}");
     }
+}
+
+#[tokio::test]
+async fn test_do_cad() {
+    let mut reference = reference();
+    reference.set_cad_params(&sx128x_lora_cad_params_t {
+        cad_symb_nb: sx128x_lora_cad_symbs_e::SX128X_LORA_CAD_08_SYMB,
+    });
+    reference.set_cad();
+    let mut radio = get_sx1280();
+    let mdltn_params = radio
+        .create_modulation_params(SpreadingFactor::_7, Bandwidth::_400KHz, CodingRate::_4_5, TEST_FREQ_HZ)
+        .unwrap();
+    radio.do_cad(&mdltn_params).await.unwrap();
+    assert_eq!(radio.take_spi(), reference.inner);
+
+    // CadDone with CadDetected reports activity
+    let mut radio = get_sx1280();
+    radio.spi_mut().prime_read(&[0x15, 0x00], &[0x30, 0x00]);
+    let mut detected = false;
+    let state = radio
+        .process_irq_event(RadioMode::ChannelActivityDetection, Some(&mut detected), false)
+        .await
+        .unwrap();
+    assert!(matches!(state, Some(IrqState::Done)));
+    assert!(detected);
 }
 
 #[tokio::test]
