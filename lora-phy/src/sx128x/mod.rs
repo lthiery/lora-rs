@@ -39,10 +39,8 @@ pub struct Config<C: Sx128xVariant> {
     pub chip: C,
     /// Whether board is using crystal oscillator or external clock
     pub tcxo_used: bool,
-    /// TODO
-    pub tx_boost: bool,
-    /// TODO
-    pub rx_boost: bool,
+    /// Whether board has the inductor for the DC-DC regulator (Section 14.7.2)
+    pub use_dcdc: bool,
 }
 
 /// Base for the RadioKind implementation for the LoRa chip kind and board type
@@ -151,6 +149,14 @@ where
             // TODO: maybe introduce explicit error code
             return Err(RadioError::InvalidConfiguration);
         }
+        let regulator = if self.config.use_dcdc {
+            RegulatorMode::DcDc
+        } else {
+            RegulatorMode::Ldo
+        };
+        self.intf
+            .write(&[OpCode::SetRegulatorMode as u8, regulator as u8], false)
+            .await?;
         self.set_packet_type(PacketType::LoRa).await?;
         self.set_lora_sync_word(sync_word).await?;
         self.set_tx_rx_buffer_base_address(0, 0).await?;
@@ -184,31 +190,24 @@ where
     }
 
     async fn set_modulation_params(&mut self, mdltn_params: &ModulationParams) -> Result<(), RadioError> {
-        info!("set_modulation_params: {:02X}", OpCode::SetModulationParams as u8);
-        let mod_param_1 = spreading_factor_value(mdltn_params.spreading_factor)?;
-        let mod_param_2 = bandwidth_value(mdltn_params.bandwidth)?;
-        let mod_param_3 = coding_rate_value(mdltn_params.coding_rate)?;
-        let buffer = [OpCode::SetModulationParams as u8, mod_param_1, mod_param_2, mod_param_3];
+        let buffer = [
+            OpCode::SetModulationParams as u8,
+            spreading_factor_value(mdltn_params.spreading_factor)?,
+            bandwidth_value(mdltn_params.bandwidth)?,
+            coding_rate_value(mdltn_params.coding_rate)?,
+        ];
         self.intf.write(&buffer, false).await?;
-        // section 14.4.1, before table 14-48
-        self.write_register(
-            Register::SfAdditionalConfiguration,
-            match mdltn_params.spreading_factor {
-                SpreadingFactor::_5 | SpreadingFactor::_6 => 0x1E,
-                SpreadingFactor::_7 | SpreadingFactor::_8 => 0x37,
-                SpreadingFactor::_9 | SpreadingFactor::_10 | SpreadingFactor::_11 | SpreadingFactor::_12 => 0x32,
-            },
-        )
-        .await?;
-        self.write_register(Register::FrequencyErrorCorrection, 0x01).await?;
-        // These two follow the RadioLib
-        let buffer = [OpCode::SetCadParams as u8, CadSymbolNum::_8 as u8];
-        self.intf.write(&buffer, false).await?;
-        // 14.7.2: Assumes we don't have an extra inductor, might need confuration.
-        let buffer = [OpCode::SetRegulatorMode as u8, 0x00];
-        self.intf.write(&buffer, false).await?;
-        // TODO: limit payload lenth, after table 14-49.
-        Ok(())
+        // Section 14.4.1: register 0x925 follows the spreading factor
+        let sf_cfg = match mdltn_params.spreading_factor {
+            SpreadingFactor::_5 | SpreadingFactor::_6 => 0x1E,
+            SpreadingFactor::_7 | SpreadingFactor::_8 => 0x37,
+            _ => 0x32,
+        };
+        self.write_register(Register::SfAdditionalConfiguration, sf_cfg).await?;
+        // Section 14.4.1: frequency error correction mode 1 in bits 2:0 of 0x93C
+        let fec = self.read_register(Register::FrequencyErrorCorrection).await?;
+        self.write_register(Register::FrequencyErrorCorrection, (fec & !0x07) | 0x01)
+            .await
     }
 
     fn create_packet_params(

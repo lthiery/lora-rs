@@ -8,8 +8,7 @@ pub fn get_sx1280() -> Sx128x<CommandStreamFixture, DummyVariant, Sx1280> {
         Config {
             chip: Sx1280,
             tcxo_used: false,
-            tx_boost: false,
-            rx_boost: false,
+            use_dcdc: false,
         },
     )
 }
@@ -21,8 +20,7 @@ pub fn get_sx1281() -> Sx128x<CommandStreamFixture, DummyVariant, Sx1281> {
         Config {
             chip: Sx1281,
             tcxo_used: false,
-            tx_boost: false,
-            rx_boost: false,
+            use_dcdc: false,
         },
     )
 }

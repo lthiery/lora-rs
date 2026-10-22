@@ -65,6 +65,12 @@ pub enum PacketType {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RegulatorMode {
+    Ldo = 0x00,
+    DcDc = 0x01,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(dead_code)]
 #[allow(clippy::upper_case_acronyms)]
 pub enum CadSymbolNum {
@@ -323,7 +329,7 @@ pub enum RampTime {
 
 pub fn spreading_factor_value(spreading_factor: SpreadingFactor) -> Result<u8, RadioError> {
     match spreading_factor {
-        SpreadingFactor::_5 => Err(RadioError::UnavailableSpreadingFactor),
+        SpreadingFactor::_5 => Ok(0x50),
         SpreadingFactor::_6 => Ok(0x60),
         SpreadingFactor::_7 => Ok(0x70),
         SpreadingFactor::_8 => Ok(0x80),
@@ -350,6 +356,8 @@ pub fn coding_rate_value(cr: CodingRate) -> Result<u8, RadioError> {
         CodingRate::_4_6 => Ok(0x02),
         CodingRate::_4_7 => Ok(0x03),
         CodingRate::_4_8 => Ok(0x04),
-        _ => Err(RadioError::UnavailableCodingRate),
+        CodingRate::LI_4_5 => Ok(0x05),
+        CodingRate::LI_4_6 => Ok(0x06),
+        CodingRate::LI_4_8 => Ok(0x07),
     }
 }
