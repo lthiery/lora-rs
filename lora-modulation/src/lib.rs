@@ -146,6 +146,9 @@ impl BaseBandModulationParams {
     /// instead. Both ends of a link must agree on this bit, so match the reference.
     pub const fn low_data_rate_optimize(sf: SpreadingFactor, bw: Bandwidth) -> bool {
         match bw {
+            // The 2.4 GHz bandwidths (SX128x) have no low data rate optimize
+            // setting; the RAL table does not list them either.
+            Bandwidth::_200KHz | Bandwidth::_400KHz | Bandwidth::_800KHz | Bandwidth::_1600KHz => false,
             Bandwidth::_500KHz => false,
             Bandwidth::_250KHz => matches!(sf, SpreadingFactor::_12),
             Bandwidth::_125KHz => matches!(sf, SpreadingFactor::_11 | SpreadingFactor::_12),

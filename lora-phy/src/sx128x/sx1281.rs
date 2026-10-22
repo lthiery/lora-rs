@@ -1,7 +1,7 @@
 use crate::mod_params::{ModulationParams, PacketParams, RadioError};
 use crate::mod_traits::InterfaceVariant;
 use crate::sx128x::radio_kind_params::{
-    OcpTrim, PaConfig, PaDac, RampTime, Register, Sx128xVariant,  spreading_factor_value,
+    OcpTrim, PaConfig, PaDac, RampTime, Register, Sx128xVariant, spreading_factor_value,
 };
 use crate::sx128x::{
     SX1286_RF_MID_BAND_THRESH, SX1286_RSSI_OFFSET_HF, SX1286_RSSI_OFFSET_LF, Sx128x, pll_step_to_freq,
@@ -20,8 +20,6 @@ pub struct Sx1281Data {
 
 impl Sx128xVariant for Sx1281 {
     type Data = Sx1281Data;
-
-
 
     async fn set_packet_params<SPI: SpiDevice<u8>, IV: InterfaceVariant>(
         radio: &mut Sx128x<SPI, IV, Self>,

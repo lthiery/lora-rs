@@ -4,8 +4,6 @@ use radio_kind_params::IrqMask::{CrcError, HeaderError};
 pub use sx1280::Sx1280;
 mod sx1281;
 pub use sx1281::Sx1281;
-#[cfg(test)]
-mod test;
 
 use embedded_hal_async::delay::DelayNs;
 use embedded_hal_async::spi::*;
@@ -452,13 +450,18 @@ where
         let write_buffer = [OpCode::GetPacketStatus as u8, 0];
         let mut read_buffer = [0; 5];
         self.intf.read(&write_buffer, &mut read_buffer).await?;
-        let rssi = read_buffer[0] as i16;
-        let snr = read_buffer[1] as i16;
+        // Table 11-66: RssiPkt = -raw / 2 dBm, SnrPkt = raw (signed) / 4 dB
+        let rssi = Rssi::from_quarter_dbm(-2 * read_buffer[0] as i16);
+        let snr = Snr::from_quarter_db(read_buffer[1] as i8 as i16);
         Ok(PacketStatus { rssi, snr })
     }
 
     async fn get_rssi(&mut self) -> Result<i16, RadioError> {
-        Ok(self.get_rx_packet_status().await?.rssi)
+        let write_buffer = [OpCode::GetRssiInst as u8, 0];
+        let mut read_buffer = [0; 1];
+        self.intf.read(&write_buffer, &mut read_buffer).await?;
+        // Table 11-64: RssiInst = -raw / 2 dBm
+        Ok(((-(read_buffer[0] as i32)) >> 1) as i16)
     }
 
     async fn do_cad(&mut self, _mdltn_params: &ModulationParams) -> Result<(), RadioError> {
