@@ -294,21 +294,18 @@ where
         self.intf.write(&buf, false).await
     }
 
-    // Set parameters associated with power for a send operation.
-    //   p_out                   desired RF output power (dBm)
-    //   mdltn_params            needed for a power vs channel frequency validation
-    //   is_tx_prep              indicates which ramp up time to use
     async fn set_tx_power_and_ramp_time(
         &mut self,
         p_out: i32,
         _mdltn_params: Option<&ModulationParams>,
-        is_tx_prep: bool,
+        _is_tx_prep: bool,
     ) -> Result<(), RadioError> {
-        debug!("sx128x::set_tx_power_and_ramp_time:tx power = {}", p_out);
-        // 10us, as in Radiolib
-        let ramp_time = RampTime::Ramp10Us;
-        let power = p_out + 18;
-        let write_buffer = [OpCode::SetTxParams as u8, power as u8, ramp_time as u8];
+        // Table 11-49: -18 to +13 dBm, sent with an offset of 18
+        if !(-18..=13).contains(&p_out) {
+            return Err(RadioError::InvalidOutputPowerForFrequency);
+        }
+        let power = (p_out + 18) as u8;
+        let write_buffer = [OpCode::SetTxParams as u8, power, RampTime::Ramp10Us as u8];
         self.intf.write(&write_buffer, false).await
     }
 
