@@ -359,8 +359,8 @@ pub fn coding_rate_value(cr: CodingRate) -> Result<u8, RadioError> {
         CodingRate::_4_6 => Ok(0x02),
         CodingRate::_4_7 => Ok(0x03),
         CodingRate::_4_8 => Ok(0x04),
-        CodingRate::LI_4_5 => Ok(0x05),
-        CodingRate::LI_4_6 => Ok(0x06),
-        CodingRate::LI_4_8 => Ok(0x07),
+        CodingRate::Li4_5 => Ok(0x05),
+        CodingRate::Li4_6 => Ok(0x06),
+        CodingRate::Li4_8 => Ok(0x07),
     }
 }

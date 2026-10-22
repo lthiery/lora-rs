@@ -96,10 +96,10 @@ pub enum CodingRate {
     _4_6,
     _4_7,
     _4_8,
-    // See Table 14-19 in SX128x datasheet
-    LI_4_5,
-    LI_4_6,
-    LI_4_8,
+    /// Long interleaving, SX128x only (Table 14-49 in its datasheet)
+    Li4_5,
+    Li4_6,
+    Li4_8,
 }
 
 impl CodingRate {
@@ -109,7 +109,9 @@ impl CodingRate {
             CodingRate::_4_6 => 6,
             CodingRate::_4_7 => 7,
             CodingRate::_4_8 => 8,
-            _ => unreachable!()
+            CodingRate::Li4_5 => 5,
+            CodingRate::Li4_6 => 6,
+            CodingRate::Li4_8 => 8,
         }
     }
 }
@@ -148,7 +150,9 @@ impl BaseBandModulationParams {
         match bw {
             // The 2.4 GHz bandwidths (SX128x) have no low data rate optimize
             // setting; the RAL table does not list them either.
-            Bandwidth::_200KHz | Bandwidth::_400KHz | Bandwidth::_800KHz | Bandwidth::_1600KHz => false,
+            Bandwidth::_200KHz | Bandwidth::_400KHz | Bandwidth::_800KHz | Bandwidth::_1600KHz => {
+                false
+            }
             Bandwidth::_500KHz => false,
             Bandwidth::_250KHz => matches!(sf, SpreadingFactor::_12),
             Bandwidth::_125KHz => matches!(sf, SpreadingFactor::_11 | SpreadingFactor::_12),

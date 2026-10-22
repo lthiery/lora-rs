@@ -121,7 +121,7 @@ async fn test_modulation_params() {
         (
             SpreadingFactor::_9,
             Bandwidth::_800KHz,
-            CodingRate::LI_4_5,
+            CodingRate::Li4_5,
             SX128X_LORA_RANGING_SF9,
             SX128X_LORA_RANGING_BW_800,
             SX128X_LORA_RANGING_CR_LI_4_5,
@@ -129,7 +129,7 @@ async fn test_modulation_params() {
         (
             SpreadingFactor::_10,
             Bandwidth::_800KHz,
-            CodingRate::LI_4_8,
+            CodingRate::Li4_8,
             SX128X_LORA_RANGING_SF10,
             SX128X_LORA_RANGING_BW_800,
             SX128X_LORA_RANGING_CR_LI_4_8,
