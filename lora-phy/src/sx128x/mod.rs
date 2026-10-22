@@ -107,7 +107,7 @@ where
 
     async fn set_packet_type(&mut self, packet_type: PacketType) -> Result<(), RadioError> {
         let write_buffer = [OpCode::SetPacketType as u8, packet_type as u8];
-        self.intf.write(&write_buffer, true).await
+        self.intf.write(&write_buffer, false).await
     }
 
     fn preamble_length_value(&self, preamble_length: u16) -> Result<u8, RadioError> {
@@ -189,7 +189,7 @@ where
         let mod_param_2 = bandwidth_value(mdltn_params.bandwidth)?;
         let mod_param_3 = coding_rate_value(mdltn_params.coding_rate)?;
         let buffer = [OpCode::SetModulationParams as u8, mod_param_1, mod_param_2, mod_param_3];
-        self.intf.write(&buffer, true).await?;
+        self.intf.write(&buffer, false).await?;
         // section 14.4.1, before table 14-48
         self.write_register(
             Register::SfAdditionalConfiguration,
@@ -203,10 +203,10 @@ where
         self.write_register(Register::FrequencyErrorCorrection, 0x01).await?;
         // These two follow the RadioLib
         let buffer = [OpCode::SetCadParams as u8, CadSymbolNum::_8 as u8];
-        self.intf.write(&buffer, true).await?;
+        self.intf.write(&buffer, false).await?;
         // 14.7.2: Assumes we don't have an extra inductor, might need confuration.
         let buffer = [OpCode::SetRegulatorMode as u8, 0x00];
-        self.intf.write(&buffer, true).await?;
+        self.intf.write(&buffer, false).await?;
         // TODO: limit payload lenth, after table 14-49.
         Ok(())
     }
@@ -290,7 +290,7 @@ where
             tx_base_addr as u8,
             rx_base_addr as u8,
         ];
-        self.intf.write(&buf, true).await
+        self.intf.write(&buf, false).await
     }
 
     // Set parameters associated with power for a send operation.
@@ -308,7 +308,7 @@ where
         let ramp_time = RampTime::Ramp10Us;
         let power = p_out + 18;
         let write_buffer = [OpCode::SetTxParams as u8, power as u8, ramp_time as u8];
-        self.intf.write(&write_buffer, true).await
+        self.intf.write(&write_buffer, false).await
     }
 
     async fn set_packet_params(&mut self, pkt_params: &PacketParams) -> Result<(), RadioError> {
@@ -323,7 +323,7 @@ where
             0,
             0,
         ];
-        self.intf.write(&buffer, true).await
+        self.intf.write(&buffer, false).await
     }
 
     // Calibrate the image rejection based on the given frequency
@@ -335,19 +335,19 @@ where
     async fn set_channel(&mut self, frequency_in_hz: u32) -> Result<(), RadioError> {
         let pll_bytes = freq_to_pll_step(frequency_in_hz).to_be_bytes();
         let buffer = [OpCode::SetRfFrequency as u8, pll_bytes[1], pll_bytes[2], pll_bytes[3]];
-        self.intf.write(&buffer, true).await
+        self.intf.write(&buffer, false).await
     }
 
     async fn set_payload(&mut self, payload: &[u8]) -> Result<(), RadioError> {
         let write_buffer = [OpCode::WriteBuffer as u8, 0];
-        self.intf.write_with_payload(&write_buffer, payload, true).await
+        self.intf.write_with_payload(&write_buffer, payload, false).await
     }
 
     async fn do_tx(&mut self) -> Result<(), RadioError> {
         self.intf.iv.enable_rf_switch_tx().await?;
         // Table 11-22, no timeout
         let write_buffer = [OpCode::SetTx as u8, 0, 0, 0];
-        self.intf.write(&write_buffer, true).await
+        self.intf.write(&write_buffer, false).await
     }
 
     async fn do_rx(&mut self, rx_mode: RxMode) -> Result<(), RadioError> {
@@ -361,7 +361,7 @@ where
         };
         let pbb = period_base_count.to_be_bytes();
         let buffer = [OpCode::SetRx as u8, period_base as u8, pbb[0], pbb[1]];
-        self.intf.write(&buffer, true).await
+        self.intf.write(&buffer, false).await
     }
 
     async fn get_rx_payload(
@@ -426,7 +426,7 @@ where
             match radio_mode {
                 RadioMode::Sleep | RadioMode::Standby => {
                     let buffer = irq_dio1_buffer_from_params(0, 0, 0, 0);
-                    self.intf.write(&buffer, true).await?
+                    self.intf.write(&buffer, false).await?
                 }
                 RadioMode::FrequencySynthesis => todo!(),
                 RadioMode::Transmit => {
@@ -440,7 +440,7 @@ where
                     let dio2_mask: u16 = 0;
                     let dio3_mask: u16 = 0;
                     let buffer = irq_dio1_buffer_from_params(irq_mask, dio1_mask, dio2_mask, dio3_mask);
-                    self.intf.write(&buffer, true).await?
+                    self.intf.write(&buffer, false).await?
                 }
                 RadioMode::Receive(rx_mode) => match rx_mode {
                     RxMode::Single(_) => todo!(),
@@ -456,7 +456,7 @@ where
                         let dio2_mask: u16 = 0;
                         let dio3_mask: u16 = 0;
                         let buffer = irq_dio1_buffer_from_params(irq_mask, dio1_mask, dio2_mask, dio3_mask);
-                        self.intf.write(&buffer, true).await?
+                        self.intf.write(&buffer, false).await?
                     }
                     RxMode::DutyCycle(_duty_cycle_params) => todo!(),
                 },
@@ -512,7 +512,7 @@ where
     async fn clear_irq_status(&mut self) -> Result<(), RadioError> {
         debug!("sx128x::clear_irq_status");
         let buffer = [OpCode::ClrIrqStatus as u8, 0xff, 0xff];
-        self.intf.write(&buffer, true).await
+        self.intf.write(&buffer, false).await
     }
 
     /// Process the radio IRQ. Log unexpected interrupts. Packets from other
