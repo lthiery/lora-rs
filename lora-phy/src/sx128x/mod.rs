@@ -68,27 +68,19 @@ where
     }
 
     async fn read_register(&mut self, register: Register) -> Result<u8, RadioError> {
-        // After the register, a NOP byte is needed.
-        debug!("sx128x::read_register");
-        let write_buffer = [OpCode::ReadRegister as u8, register.addr1(), register.addr2(), 0x00];
         let mut read_buffer = [0x00u8; 1];
-        self.intf.read(&write_buffer, &mut read_buffer).await?;
+        self.read_registers(register, &mut read_buffer).await?;
         Ok(read_buffer[0])
     }
 
-    async fn read_register_into_buffer(
-        &mut self,
-        register: Register,
-        read_buffer: &mut [u8],
-    ) -> Result<(), RadioError> {
+    // Consecutive registers starting at `register`
+    async fn read_registers(&mut self, register: Register, read_buffer: &mut [u8]) -> Result<(), RadioError> {
         // After the register, a NOP byte is needed.
-        debug!("sx128x::read_register");
         let write_buffer = [OpCode::ReadRegister as u8, register.addr1(), register.addr2(), 0x00];
-        self.intf.read(&write_buffer, read_buffer).await?;
-        Ok(())
+        self.intf.read(&write_buffer, read_buffer).await
     }
 
-    async fn write_buffer(&mut self, register: Register, buf: &[u8]) -> Result<(), RadioError> {
+    async fn write_registers(&mut self, register: Register, buf: &[u8]) -> Result<(), RadioError> {
         let write_buffer = [OpCode::WriteRegister as u8, register.addr1(), register.addr2()];
         self.intf.write_with_payload(&write_buffer, buf, false).await
     }
@@ -146,8 +138,7 @@ where
 
     async fn init_lora(&mut self, sync_word: u16) -> Result<(), RadioError> {
         let mut write_buffer = [0; 16];
-        self.read_register_into_buffer(Register::VersionString, &mut write_buffer)
-            .await?;
+        self.read_registers(Register::VersionString, &mut write_buffer).await?;
         debug!("firmware versions: {:?}", write_buffer);
         if b"SX1280" != &write_buffer[0..6] {
             // TODO: maybe introduce explicit error code
@@ -168,8 +159,14 @@ where
     }
 
     async fn set_lora_sync_word(&mut self, sync_word: u16) -> Result<(), RadioError> {
-        let sync_word_buffer = [(sync_word >> 8) as u8, sync_word as u8];
-        self.write_buffer(Register::LoRaSyncWord0, &sync_word_buffer).await
+        // The sync word is the upper nibbles of 0x944/0x945; the lower
+        // nibbles are chip state and are preserved, as SWL2001 does
+        let word = sync_word_to_legacy(sync_word)?;
+        let mut regs = [0u8; 2];
+        self.read_registers(Register::LoRaSyncWord0, &mut regs).await?;
+        regs[0] = (regs[0] & 0x0F) | (word & 0xF0);
+        regs[1] = (regs[1] & 0x0F) | (word << 4);
+        self.write_registers(Register::LoRaSyncWord0, &regs).await
     }
 
     fn create_modulation_params(
@@ -251,7 +248,8 @@ where
                 self.intf.write(&[OpCode::Nop as u8], false).await?;
                 // sx128x_wakeup in SWL2001: RSSI reads 0 after a sleep until
                 // this undocumented register blob is rewritten
-                self.write_buffer(Register::RssiSnrBugfix, &RSSI_SNR_BUGFIX_BLOB).await
+                self.write_registers(Register::RssiSnrBugfix, &RSSI_SNR_BUGFIX_BLOB)
+                    .await
             }
             _ => self.intf.iv.wait_on_busy().await,
         }
