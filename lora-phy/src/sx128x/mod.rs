@@ -374,28 +374,27 @@ where
         rx_pkt_params: &PacketParams,
         receiving_buffer: &mut [u8],
     ) -> Result<u8, RadioError> {
+        // Table 11-63: payload length, then the offset of the packet in the buffer
+        let mut status = [0u8; 2];
+        self.intf
+            .read(&[OpCode::GetRxBufferStatus as u8, OpCode::Nop as u8], &mut status)
+            .await?;
         let payload_length = if rx_pkt_params.implicit_header {
             rx_pkt_params.payload_length
         } else {
-            let write_buffer = [OpCode::GetRxBufferStatus as u8, 0];
-            let mut read_buffer = [0; 2];
-            self.intf.read(&write_buffer, &mut read_buffer).await?;
-            read_buffer[0]
+            status[0]
         };
+        let offset = status[1];
         if (payload_length as usize) > receiving_buffer.len() {
             return Err(RadioError::PayloadSizeMismatch(
                 payload_length as usize,
                 receiving_buffer.len(),
             ));
         }
-        // TODO: So far hard-coded
-        let fifo_offset = 0;
-        let write_buffer = [OpCode::ReadBuffer as u8, fifo_offset, 0];
-        let mut read_buffer = [0; 256];
+        let write_buffer = [OpCode::ReadBuffer as u8, offset, OpCode::Nop as u8];
         self.intf
-            .read(&write_buffer, &mut read_buffer[0..payload_length as usize])
+            .read(&write_buffer, &mut receiving_buffer[0..payload_length as usize])
             .await?;
-        receiving_buffer[0..payload_length as usize].copy_from_slice(&mut read_buffer[0..payload_length as usize]);
         Ok(payload_length)
     }
 
