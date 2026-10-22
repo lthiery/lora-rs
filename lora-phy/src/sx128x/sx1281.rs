@@ -3,9 +3,7 @@ use crate::mod_traits::InterfaceVariant;
 use crate::sx128x::radio_kind_params::{
     OcpTrim, PaConfig, PaDac, RampTime, Register, Sx128xVariant, spreading_factor_value,
 };
-use crate::sx128x::{
-    SX1286_RF_MID_BAND_THRESH, SX1286_RSSI_OFFSET_HF, SX1286_RSSI_OFFSET_LF, Sx128x, pll_step_to_freq,
-};
+use crate::sx128x::{SX1286_RF_MID_BAND_THRESH, SX1286_RSSI_OFFSET_HF, SX1286_RSSI_OFFSET_LF, Sx128x};
 use embedded_hal_async::spi::SpiDevice;
 use lora_modulation::Bandwidth;
 

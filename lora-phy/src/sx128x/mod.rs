@@ -29,19 +29,16 @@ const SX1286_RSSI_OFFSET_LF: i16 = -164;
 const SX1286_RSSI_OFFSET_HF: i16 = -157;
 const SX1286_RF_MID_BAND_THRESH: u32 = 525_000_000;
 
-const RADIOLIB_SX128X_CRYSTAL_FREQ: f32 = 52_000_000.0;
-const RADIOLIB_SX128X_DIV_EXPONENT: usize = 18;
+// Frequency synthesizer step: FXOSC (52 MHz) / 2^18 = 198.364 Hz. Same
+// fixed-point rounding as SWL2001: the step is scaled by 2^10 so the
+// integer division keeps 10 fractional bits, then rounded to nearest.
+const PLL_STEP_SHIFT: u32 = 10;
+const PLL_STEP_SCALED: u32 = 52_000_000 >> (18 - PLL_STEP_SHIFT);
 
-// Frequency synthesizer step: FXOSC (32 MHz) / 524288 (2^19) = 61.03515625 Hz
 fn freq_to_pll_step(freq_in_hz: u32) -> u32 {
-    // Full-precision integer form of freq / 61.03515625. The previous
-    // truncate-then-shift shortcut zeroed the low 8 pll-step bits, putting
-    // fractional-MHz channels (868.1, 903.9, ...) up to ~15 kHz off.
-    (((freq_in_hz as u64) << 19) / 32_000_000) as u32
-}
-
-fn pll_step_to_freq(pll_step: u32) -> u32 {
-    (((pll_step as u64) * 32_000_000) >> 19) as u32
+    let steps_int = freq_in_hz / PLL_STEP_SCALED;
+    let steps_frac = freq_in_hz - steps_int * PLL_STEP_SCALED;
+    (steps_int << PLL_STEP_SHIFT) + ((steps_frac << PLL_STEP_SHIFT) + (PLL_STEP_SCALED >> 1)) / PLL_STEP_SCALED
 }
 
 // RSSI requires linearization when SNR >= 0
@@ -382,12 +379,7 @@ where
     }
 
     async fn set_channel(&mut self, frequency_in_hz: u32) -> Result<(), RadioError> {
-        let frequency_in_hz = frequency_in_hz as f32;
-        let exp = (1 << RADIOLIB_SX128X_DIV_EXPONENT) as f32;
-        // Section 4.3
-        let pll = (frequency_in_hz * exp / RADIOLIB_SX128X_CRYSTAL_FREQ) as u32;
-        debug!("channel = {}, pll = {}", frequency_in_hz, pll);
-        let pll_bytes = pll.to_be_bytes();
+        let pll_bytes = freq_to_pll_step(frequency_in_hz).to_be_bytes();
         let buffer = [OpCode::SetRfFrequency as u8, pll_bytes[1], pll_bytes[2], pll_bytes[3]];
         self.intf.write(&buffer, true).await
     }
@@ -633,20 +625,12 @@ fn irq_dio1_buffer_from_params(irq_mask: u16, dio1_mask: u16, dio2_mask: u16, di
 mod tests {
     use super::*;
 
-    // FXOSC[32 MHz] * 1000000 (Hz/MHz) / 524288 (2^19)
-    const FREQUENCY_SYNTHESIZER_STEP: f64 = 61.03515625;
-
     #[test]
-    fn pll_step_freq_u32_vs_f64() {
-        // Simplified integer calculation converges with floating
-        // point formula for full and half megahertz values
-        const D: u32 = 2;
-        for freq in D * 137..=(D * 1020) {
-            let f = freq * (1_000_000 / D);
-
-            let pll = freq_to_pll_step(f);
-            assert_eq!(pll, (f as f64 / FREQUENCY_SYNTHESIZER_STEP) as u32);
-            assert_eq!(pll_step_to_freq(pll), f);
+    fn pll_step_rounds_to_nearest() {
+        // FXOSC 52 MHz / 2^18
+        const STEP_HZ: f64 = 52_000_000.0 / 262_144.0;
+        for freq in (2_400_000_000u32..=2_500_000_000).step_by(1_234_567) {
+            assert_eq!(freq_to_pll_step(freq), (freq as f64 / STEP_HZ).round() as u32, "{freq}");
         }
     }
 
