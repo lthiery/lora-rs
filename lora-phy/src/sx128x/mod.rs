@@ -17,6 +17,10 @@ use crate::{InterfaceVariant, RadioKind, SpiInterface};
 // Limits for preamble detection window in single reception mode
 const SX128X_MAX_LORA_SYMB_NUM_TIMEOUT: u16 = 1023;
 
+// SWL2001 sx128x_regs.h: "the blob that must be written after wakeup to fix
+// the rssi is 0 after a sleep bug"
+const RSSI_SNR_BUGFIX_BLOB: [u8; 4] = [0x00, 0xAD, 0x08, 0x9A];
+
 // Frequency synthesizer step: FXOSC (52 MHz) / 2^18 = 198.364 Hz. Same
 // fixed-point rounding as SWL2001: the step is scaled by 2^10 so the
 // integer division keeps 10 fractional bits, then rounded to nearest.
@@ -236,17 +240,22 @@ where
         Ok(())
     }
 
-    async fn ensure_ready(&mut self, _mode: RadioMode) -> Result<(), RadioError> {
-        debug!("sx128x::ensure_ready");
-        self.set_standby().await?;
-        Ok(())
+    async fn ensure_ready(&mut self, mode: RadioMode) -> Result<(), RadioError> {
+        match mode {
+            RadioMode::Sleep => {
+                // Any NSS assertion wakes the chip; a NOP keeps the bus
+                // traffic explicit. BUSY is high until the oscillator runs.
+                self.intf.write(&[OpCode::Nop as u8], false).await?;
+                // sx128x_wakeup in SWL2001: RSSI reads 0 after a sleep until
+                // this undocumented register blob is rewritten
+                self.write_buffer(Register::RssiSnrBugfix, &RSSI_SNR_BUGFIX_BLOB).await
+            }
+            _ => self.intf.iv.wait_on_busy().await,
+        }
     }
 
     async fn set_standby(&mut self) -> Result<(), RadioError> {
-        debug!("sx128x::set_standby");
         self.intf.iv.disable_rf_switch().await?;
-        // send a NOP to wake up
-        self.intf.write(&[0], true).await?;
         let buf = [
             OpCode::SetStandby as u8,
             if self.config.tcxo_used {
@@ -255,11 +264,7 @@ where
                 StandbyConfig::Rc
             } as u8,
         ];
-        let mut read_buf = [0; 0];
-        // TODO: evaluate status as in RadioLib
-        let status = self.intf.read_with_status(&buf, &mut read_buf).await?;
-        info!("status: {:02X}", status);
-        Ok(())
+        self.intf.write(&buf, false).await
     }
 
     async fn set_sleep(&mut self, _warm_start_if_possible: bool, _delay: &mut impl DelayNs) -> Result<(), RadioError> {

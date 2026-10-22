@@ -202,8 +202,10 @@ pub enum Register {
     SyncAddress3Byte1 = 0x09DB,
     /// Sync Word 3 (Byte 0)
     SyncAddress3Byte0 = 0x09DC,
-    /// VersionString, not found in datasheet!
-    VersionString = 0x1F0,
+    /// Firmware version string (SWL2001 `SX128X_REG_FW_VERSION`)
+    VersionString = 0x01F0,
+    /// Undocumented; SWL2001 rewrites it after every wakeup (`SX128X_REG_RSSI_SNR_BUGFIX_ADDRESS`)
+    RssiSnrBugfix = 0x00EF,
 }
 
 impl Register {
@@ -218,6 +220,8 @@ impl Register {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[allow(dead_code)]
 pub enum OpCode {
+    /// No operation; asserting NSS for it wakes the chip from sleep
+    Nop = 0x00,
     // Table 12-1: Transceiver Available Commands
 
     // Operational Modes Functions
