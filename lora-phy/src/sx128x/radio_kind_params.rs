@@ -1,72 +1,8 @@
 use crate::mod_params::*;
-use crate::mod_traits::InterfaceVariant;
-use crate::sx128x::Sx128x;
-use embedded_hal_async::spi::SpiDevice;
 
-#[allow(async_fn_in_trait)]
-pub trait Sx128xVariant {
-    type Data: Default;
-
-    async fn set_packet_params<SPI: SpiDevice<u8>, IV: InterfaceVariant>(
-        radio: &mut Sx128x<SPI, IV, Self>,
-        pkt_params: &PacketParams,
-    ) -> Result<(), RadioError>
-    where
-        Self: Sized;
-
-    async fn rssi_offset<SPI: SpiDevice<u8>, IV: InterfaceVariant>(
-        radio: &mut Sx128x<SPI, IV, Self>,
-    ) -> Result<i16, RadioError>
-    where
-        Self: Sized;
-    async fn set_tx_continuous_wave_mode<SPI: SpiDevice<u8>, IV: InterfaceVariant>(
-        radio: &mut Sx128x<SPI, IV, Self>,
-    ) -> Result<(), RadioError>
-    where
-        Self: Sized;
-}
-
-/// Internal sx128x LoRa modes (signified by most significant bit flag)
-#[derive(Clone, Copy)]
-pub enum LoRaMode {
-    Sleep = 0x00,
-    Standby = 0x01,
-    Tx = 0x03,
-    RxContinuous = 0x05,
-    RxSingle = 0x06,
-    Cad = 0x07,
-}
-
-impl LoRaMode {
-    /// Mode value, including LoRa flag
-    pub fn value(self) -> u8 {
-        (self as u8) | 0x80u8
-    }
-}
-
-// TODO:
-// IRQ mapping for sx128x chips:
-// DIO0 - RxDone, TxDone, CadDone
-// DIO1 - RxTimeout, FhssChangeChannel, CadDetected
-// DIO2 - 3x FhssChangeChannel
-// DIO3 - CadDone, ValidHeader, PayloadCrcError
-// DIO4 - CadDetected, *PllLock, *PllLock
-// DIO5 - *ModeReady, *ClkOut, *ClkOut
-
-#[allow(dead_code)]
-pub enum DioMapping1Dio0 {
-    RxDone = 0b00 << 6,
-    TxDone = 0b01 << 6,
-    CadDone = 0b10 << 6,
-    Other = 0b11 << 6,
-    Mask = 0x3f,
-}
-
-impl DioMapping1Dio0 {
-    pub fn value(self) -> u8 {
-        self as u8
-    }
-}
+/// Chip variant marker. The SX1280 and SX1281 share the LoRa command set,
+/// the SX1281 only lacks the ranging engine.
+pub trait Sx128xVariant {}
 
 #[allow(dead_code, non_camel_case_types)]
 pub enum PeriodBase {
@@ -74,37 +10,6 @@ pub enum PeriodBase {
     _62_5us = 0x01,
     _1ms = 0x02,
     _4_ms = 0x03,
-}
-
-#[allow(dead_code)]
-pub enum DioMapping1Dio1 {
-    RxTimeOut = 0b00 << 4,
-    FhssChangeChannel = 0b01 << 4,
-    CadDetected = 0b10 << 4,
-    Other = 0b11 << 4,
-    Mask = 0xcf,
-}
-
-#[allow(dead_code)]
-impl DioMapping1Dio1 {
-    pub fn value(self) -> u8 {
-        self as u8
-    }
-}
-
-#[allow(dead_code)]
-pub enum DioMapping1Dio3 {
-    CadDone = 0,
-    ValidHeader = 0b01,
-    PayloadCrcError = 0b10,
-    Other = 0b11,
-    Mask = 0xfc,
-}
-
-impl DioMapping1Dio3 {
-    pub fn value(self) -> u8 {
-        self as u8
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -301,7 +206,6 @@ pub enum Register {
     VersionString = 0x1F0,
 }
 
-#[allow(non_upper_case_globals)]
 impl Register {
     pub fn addr1(self) -> u8 {
         ((self as u16 & 0xFF00) >> 8) as u8
@@ -312,11 +216,7 @@ impl Register {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-// `from_repr` lets the sx126x/sx128x emulator dispatch a wire byte back to a variant
-#[cfg_attr(test, derive(strum::FromRepr))]
-#[repr(u8)]
 #[allow(dead_code)]
-#[allow(clippy::upper_case_acronyms)]
 pub enum OpCode {
     // Table 12-1: Transceiver Available Commands
 
@@ -403,15 +303,9 @@ pub enum OpCode {
     SetAdvancedRanging = 0x9A,
 }
 
-#[allow(non_upper_case_globals)]
-impl OpCode {
-    pub fn value(self) -> u8 {
-        self as u8
-    }
-}
-
 #[derive(Clone, Copy)]
 #[allow(dead_code)]
+#[allow(clippy::enum_variant_names)]
 pub enum RampTime {
     Ramp02Us = 0x00,
     Ramp04Us = 0x20,
@@ -421,100 +315,6 @@ pub enum RampTime {
     Ramp12Us = 0xA0,
     Ramp16Us = 0xC0,
     Ramp20Us = 0xE0,
-}
-
-impl RampTime {
-    pub fn value(self) -> u8 {
-        self as u8
-    }
-}
-
-#[derive(Clone, Copy)]
-#[allow(dead_code)]
-pub enum LnaGain {
-    G1 = 0x20, // maximum gain (default)
-    G2 = 0x40,
-    G3 = 0x60,
-    G4 = 0x80,
-    G5 = 0xa0,
-    G6 = 0xc0, // minumum gain
-}
-
-impl LnaGain {
-    pub fn value(self) -> u8 {
-        self as u8
-    }
-    pub fn boosted_value(self) -> u8 {
-        (self as u8) | 0x03u8
-    }
-}
-
-/// PA DAC configuration - sx1286+
-#[derive(Clone, Copy)]
-#[allow(dead_code)]
-pub enum PaDac {
-    _20DbmOn = 0x87,
-    _20DbmOff = 0x84,
-}
-
-impl PaDac {
-    pub fn value(self) -> u8 {
-        self as u8
-    }
-}
-
-/// PA configuration - sx1286+
-#[derive(Clone, Copy)]
-#[allow(dead_code)]
-pub enum PaConfig {
-    PaBoost = 0x80,
-    MaxPower7NoPaBoost = 0x70,
-}
-
-impl PaConfig {
-    pub fn value(self) -> u8 {
-        self as u8
-    }
-}
-
-#[derive(Clone, Copy)]
-#[allow(dead_code)]
-#[allow(clippy::enum_variant_names)]
-pub enum OcpTrim {
-    _45Ma = 0x00,
-    _50Ma = 0x01,
-    _55Ma = 0x02,
-    _60Ma = 0x03,
-    _65Ma = 0x04,
-    _70Ma = 0x05,
-    _75Ma = 0x06,
-    _80Ma = 0x07,
-    _85Ma = 0x08,
-    _90Ma = 0x09,
-    _95Ma = 0x0a,
-    _100Ma = 0x0b,
-    _105Ma = 0x0c,
-    _110Ma = 0x0d,
-    _115Ma = 0x0e,
-    _120Ma = 0x0f,
-    _130Ma = 0x10,
-    _140Ma = 0x11,
-    _150Ma = 0x12,
-    _160Ma = 0x13,
-    _170Ma = 0x14,
-    _180Ma = 0x15,
-    _190Ma = 0x16,
-    _200Ma = 0x17,
-    _210Ma = 0x18,
-    _220Ma = 0x19,
-    _230Ma = 0x1a,
-    _240Ma = 0x1b,
-}
-
-impl OcpTrim {
-    pub fn value(self) -> u8 {
-        (self as u8) | 0x20u8 // value plus OCP on flag
-    }
 }
 
 pub fn spreading_factor_value(spreading_factor: SpreadingFactor) -> Result<u8, RadioError> {

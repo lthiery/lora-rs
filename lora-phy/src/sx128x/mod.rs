@@ -1,6 +1,5 @@
 mod radio_kind_params;
 mod sx1280;
-use radio_kind_params::IrqMask::{CrcError, HeaderError};
 pub use sx1280::Sx1280;
 mod sx1281;
 pub use sx1281::Sx1281;
@@ -11,23 +10,12 @@ use embedded_hal_async::delay::DelayNs;
 use embedded_hal_async::spi::*;
 use radio_kind_params::*;
 
-use crate::lr1110::radio_kind_params::coding_rate_value;
 use crate::mod_params::*;
 use crate::mod_traits::IrqState;
 use crate::{InterfaceVariant, RadioKind, SpiInterface};
 
-// TCXO flag
-const TCXO_FOR_OSCILLATOR: u8 = 0x10u8;
-
 // Limits for preamble detection window in single reception mode
-const SX128X_MIN_LORA_SYMB_NUM_TIMEOUT: u16 = 4;
 const SX128X_MAX_LORA_SYMB_NUM_TIMEOUT: u16 = 1023;
-
-// Constant values need to compute the RSSI value
-const SX1282_RSSI_OFFSET: i16 = -139;
-const SX1286_RSSI_OFFSET_LF: i16 = -164;
-const SX1286_RSSI_OFFSET_HF: i16 = -157;
-const SX1286_RF_MID_BAND_THRESH: u32 = 525_000_000;
 
 // Frequency synthesizer step: FXOSC (52 MHz) / 2^18 = 198.364 Hz. Same
 // fixed-point rounding as SWL2001: the step is scaled by 2^10 so the
@@ -39,16 +27,6 @@ fn freq_to_pll_step(freq_in_hz: u32) -> u32 {
     let steps_int = freq_in_hz / PLL_STEP_SCALED;
     let steps_frac = freq_in_hz - steps_int * PLL_STEP_SCALED;
     (steps_int << PLL_STEP_SHIFT) + ((steps_frac << PLL_STEP_SHIFT) + (PLL_STEP_SCALED >> 1)) / PLL_STEP_SCALED
-}
-
-// RSSI requires linearization when SNR >= 0
-// Section 3.5.5 - Note 3
-fn linearize_rssi(rssi: u8) -> i16 {
-    // Integer approximation for RSSI * 16.0 / 15.0
-    // General formula for integer division with rounding:
-    // x / d == floor((x + floor(d / 2)) / d), when d > 0
-    const DIVISOR: i16 = 15;
-    (rssi as i16 * 16 + (DIVISOR / 2)) / DIVISOR
 }
 
 /// Configuration for SX128x-based boards
@@ -67,7 +45,6 @@ pub struct Config<C: Sx128xVariant> {
 pub struct Sx128x<SPI, IV, C: Sx128xVariant + Sized> {
     intf: SpiInterface<SPI, IV>,
     config: Config<C>,
-    data: C::Data,
 }
 
 impl<SPI, IV, C> Sx128x<SPI, IV, C>
@@ -79,11 +56,7 @@ where
     /// Create an instance of the RadioKind implementation for the LoRa chip kind and board type
     pub fn new(spi: SPI, iv: IV, config: Config<C>) -> Self {
         let intf = SpiInterface::new(spi, iv);
-        Self {
-            intf,
-            config,
-            data: Default::default(),
-        }
+        Self { intf, config }
     }
 
     // Utility functions
@@ -113,33 +86,9 @@ where
         Ok(())
     }
 
-    async fn read_buffer(&mut self, register: Register, buf: &mut [u8]) -> Result<(), RadioError> {
-        let write_buffer = [OpCode::WriteRegister as u8, register.addr1(), register.addr2()];
-        self.intf.read(&write_buffer, buf).await
-    }
-
     async fn write_buffer(&mut self, register: Register, buf: &[u8]) -> Result<(), RadioError> {
         let write_buffer = [OpCode::WriteRegister as u8, register.addr1(), register.addr2()];
         self.intf.write_with_payload(&write_buffer, buf, false).await
-    }
-
-    // Set the number of symbols the radio will wait to detect a reception (up to 1023 symbols)
-    async fn set_lora_symbol_num_timeout(&mut self, symbol_num: u16) -> Result<(), RadioError> {
-        let val = symbol_num.min(SX128X_MAX_LORA_SYMB_NUM_TIMEOUT);
-
-        // let symbol_num_msb = ((val >> 8) & 0x03) as u8;
-        // let symbol_num_lsb = (val & 0xff) as u8;
-        // let mut config_2 = self.read_register(Register::RegModemConfig2).await?;
-        // config_2 = (config_2 & 0xfcu8) | symbol_num_msb;
-        // self.write_register(Register::RegModemConfig2, config_2).await?;
-        // self.write_register(Register::RegSymbTimeoutLsb, symbol_num_lsb).await
-        todo!();
-    }
-
-    // Set the over current protection (mA) on the radio
-    async fn set_ocp(&mut self, ocp_trim: OcpTrim) -> Result<(), RadioError> {
-        todo!();
-        //self.write_register(Register::RegOcp, ocp_trim.value()).await
     }
 
     #[cfg(test)]
@@ -459,15 +408,6 @@ where
     }
 
     async fn do_cad(&mut self, _mdltn_params: &ModulationParams) -> Result<(), RadioError> {
-        // self.intf.iv.enable_rf_switch_rx().await?;
-
-        // let mut lna_gain_final = LnaGain::G1.value();
-        // if self.config.rx_boost {
-        //     lna_gain_final = LnaGain::G1.boosted_value();
-        // }
-        // self.write_register(Register::RegLna, lna_gain_final).await?;
-
-        // self.write_register(Register::RegOpMode, LoRaMode::Cad.value()).await
         todo!();
     }
 
@@ -557,25 +497,7 @@ where
                     return Ok(Some(IrqState::Done));
                 }
             }
-            // RadioMode::ChannelActivityDetection => {
-            //     if (irq_flags & IrqMask::CADDone.value()) == IrqMask::CADDone.value() {
-            //         debug!("CADDone in radio mode {}", radio_mode);
-            //         // TODO: don't like how we mutate the cad_activity_detected parameter
-            //         if let Some(cad_activity_detected) = cad_activity_detected {
-            //             // Check if the CAD (Channel Activity Detection) Activity Detected flag is set in irq_flags and then update the reference
-            //             *(cad_activity_detected) =
-            //                 (irq_flags & IrqMask::CADActivityDetected.value()) == IrqMask::CADActivityDetected.value();
-            //         }
-
-            //         return Ok(Some(IrqState::Done));
-            //     }
-            // }
-            // RadioMode::Sleep | RadioMode::Standby | RadioMode::Listen => {
-            //     warn!("IRQ during sleep/standby/listen?");
-            // }
-            // RadioMode::FrequencySynthesis => todo!(),
-            // RadioMode::Receive(RxMode::DutyCycle(_)) => todo!(),
-            e @ _ => warn!("Unknown radio mode: {:?}!", e),
+            e => warn!("Unknown radio mode: {:?}!", e),
         }
 
         // If no specific IRQ condition is met, return None
@@ -606,9 +528,9 @@ where
         irq_state
     }
 
-    /// Set the LoRa chip into the TxContinuousWave mode
     async fn set_tx_continuous_wave_mode(&mut self) -> Result<(), RadioError> {
-        C::set_tx_continuous_wave_mode(self).await
+        self.intf.iv.enable_rf_switch_tx().await?;
+        self.intf.write(&[OpCode::SetTxContinuousWave as u8], false).await
     }
 }
 
@@ -631,19 +553,6 @@ mod tests {
         const STEP_HZ: f64 = 52_000_000.0 / 262_144.0;
         for freq in (2_400_000_000u32..=2_500_000_000).step_by(1_234_567) {
             assert_eq!(freq_to_pll_step(freq), (freq as f64 / STEP_HZ).round() as u32, "{freq}");
-        }
-    }
-
-    #[test]
-    fn test_rssi_linearization() {
-        const DELTA: f32 = 0.5;
-        for offset in [SX1282_RSSI_OFFSET, SX1286_RSSI_OFFSET_LF, SX1286_RSSI_OFFSET_HF] {
-            for rssi in 0..=u8::MAX {
-                let float_rssi = offset as f32 + rssi as f32 * 16.0 / 15.0;
-                let approx_rssi = offset + linearize_rssi(rssi);
-                let error = float_rssi - approx_rssi as f32;
-                assert!(error.abs() < DELTA);
-            }
         }
     }
 }
