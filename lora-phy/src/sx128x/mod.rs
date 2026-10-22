@@ -108,20 +108,24 @@ where
         self.intf.write(&write_buffer, false).await
     }
 
-    fn preamble_length_value(&self, preamble_length: u16) -> Result<u8, RadioError> {
-        // check preamble length is even - no point even trying odd numbers
-        if preamble_length % 2 != 0 {
-            return Err(RadioError::InvalidConfiguration);
+    /// Preamble length as the chip's exponent/mantissa byte, rounded up to
+    /// the next representable length and clamped at the 61440-symbol maximum
+    /// (ral_sx128x_convert_lora_pbl_len_from_ral)
+    fn preamble_length_value(preamble_length: u16) -> u8 {
+        if preamble_length >= 61440 {
+            return 0xCF;
         }
-        for e in 1..16 {
-            for m in 1..16 {
-                let len = m * (1 << e);
-                if len >= preamble_length {
-                    return Ok((e << 4 | m) as u8);
-                }
-            }
+        let mut mant = preamble_length;
+        let mut exp = 0u8;
+        while mant > 1 && mant & 1 == 0 {
+            mant >>= 1;
+            exp += 1;
         }
-        Err(RadioError::InvalidConfiguration)
+        while mant > 15 {
+            mant = (mant + 1) >> 1;
+            exp += 1;
+        }
+        (exp << 4) | mant as u8
     }
 }
 
@@ -311,10 +315,10 @@ where
     }
 
     async fn set_packet_params(&mut self, pkt_params: &PacketParams) -> Result<(), RadioError> {
-        debug!("sx128x::set_packet_params");
+        // Table 14-50; the last two params are unused by LoRa
         let buffer = [
             OpCode::SetPacketParams as u8,
-            self.preamble_length_value(pkt_params.preamble_length)?,
+            Self::preamble_length_value(pkt_params.preamble_length),
             if pkt_params.implicit_header { 0x80 } else { 0x00 },
             pkt_params.payload_length,
             if pkt_params.crc_on { 0x20 } else { 0x00 },
@@ -322,7 +326,11 @@ where
             0,
             0,
         ];
-        self.intf.write(&buffer, false).await
+        self.intf.write(&buffer, false).await?;
+        // SWL2001 mirrors the IQ polarity into register 0x93B after every
+        // SetPacketParams (not in the datasheet)
+        let iq = if pkt_params.iq_inverted { 0x0D } else { 0x09 };
+        self.write_register(Register::LoRaIqPolarity, iq).await
     }
 
     // Calibrate the image rejection based on the given frequency

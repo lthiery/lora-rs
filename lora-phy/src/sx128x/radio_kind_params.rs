@@ -136,6 +136,8 @@ pub enum Register {
     RangingCalibrationByte0 = 0x092D,
     /// The number of bytes of the Ranging Slave ID that are checked (0: 8 bits, 1: 16 bits, 2: 24 bits, 3: 32 bits)
     RangingIdCheckLength = 0x0931,
+    /// Undocumented; SWL2001 writes the IQ polarity here after SetPacketParams (`SX128X_REG_LR_IQ_CONF`)
+    LoRaIqPolarity = 0x093B,
     /// Crystal frequency error correction mode (bits 0:2)
     FrequencyErrorCorrection = 0x093C,
     /// Peak-to-noise ratio decision threshold for the CAD
