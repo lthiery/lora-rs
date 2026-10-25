@@ -241,9 +241,18 @@ where
                 // traffic explicit. BUSY is high until the oscillator runs.
                 self.intf.write(&[OpCode::Nop as u8], false).await?;
                 // sx128x_wakeup in SWL2001: RSSI reads 0 after a sleep until
-                // this undocumented register blob is rewritten
-                self.write_registers(Register::RssiSnrBugfix, &RSSI_SNR_BUGFIX_BLOB)
-                    .await
+                // this undocumented register blob is rewritten. Only a chip
+                // that kept its LoRa configuration through the sleep needs
+                // it; after a reset the packet type is still GFSK.
+                let mut packet_type = [0u8; 1];
+                self.intf
+                    .read(&[OpCode::GetPacketType as u8, OpCode::Nop as u8], &mut packet_type)
+                    .await?;
+                if packet_type[0] == PacketType::LoRa as u8 {
+                    self.write_registers(Register::RssiSnrBugfix, &RSSI_SNR_BUGFIX_BLOB)
+                        .await?;
+                }
+                Ok(())
             }
             _ => self.intf.iv.wait_on_busy().await,
         }

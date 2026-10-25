@@ -8,6 +8,7 @@
 mod fixtures;
 use fixtures::{CommandStreamFixture, Delayer, Ops, get_sx1280, get_sx1281};
 
+use super::radio_kind_params::PacketType;
 use crate::mod_params::{RadioMode, RxMode};
 use crate::mod_traits::{IrqState, RadioKind};
 use lora_modulation::{Bandwidth, CodingRate, SpreadingFactor};
@@ -52,20 +53,22 @@ async fn test_standby() {
 async fn test_ensure_ready_after_sleep() {
     // The reference wakes the chip through its HAL (an NSS toggle, no bytes),
     // reads the packet type and rewrites the RSSI/SNR fix-up blob when it is
-    // LoRa. Ours is always LoRa, so it skips the read; the wake-up is a NOP
-    // byte on the bus. Writes match once that NOP is accounted for.
-    let mut fixture = CommandStreamFixture::new();
-    fixture.prime_read(&[0x03, 0x00], &[0x01]);
-    let mut reference = Context::new(fixture);
-    reference.wakeup();
+    // LoRa. Ours wakes with a NOP byte on the bus; the stream matches once
+    // that NOP is accounted for.
+    for packet_type in [PacketType::Gfsk, PacketType::LoRa] {
+        let mut fixture = CommandStreamFixture::new();
+        fixture.prime_read(&[0x03, 0x00], &[packet_type as u8]);
+        let mut reference = Context::new(fixture);
+        reference.wakeup();
 
-    let mut radio = get_sx1280();
-    radio.ensure_ready(RadioMode::Sleep).await.unwrap();
-    let ours = radio.take_spi();
-    let nop = Ops::Write(vec![0x00]);
-    let mut expected = vec![&nop];
-    expected.extend(reference.inner.writes());
-    assert_eq!(ours.writes(), expected);
+        let mut radio = get_sx1280();
+        radio.spi_mut().prime_read(&[0x03, 0x00], &[packet_type as u8]);
+        radio.ensure_ready(RadioMode::Sleep).await.unwrap();
+        let ours = radio.take_spi();
+        let mut expected = vec![Ops::Write(vec![0x00])];
+        expected.extend(reference.inner.ops.iter().cloned());
+        assert_eq!(ours.ops, expected, "{packet_type:?}");
+    }
 }
 
 #[tokio::test]
