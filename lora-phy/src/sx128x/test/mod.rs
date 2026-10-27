@@ -26,6 +26,17 @@ fn reference() -> Context<CommandStreamFixture> {
 }
 
 #[tokio::test]
+async fn test_reset() {
+    // Reset is the pin toggle and nothing on the bus, as in the reference.
+    // LoRa::init() follows it with ensure_ready(radio_mode) for whatever
+    // mode the driver was in; a chip put to sleep here would leave BUSY
+    // high, and the non-sleep arms of ensure_ready wait on BUSY.
+    let mut radio = get_sx1280();
+    radio.reset(&mut Delayer).await.unwrap();
+    assert!(radio.take_spi().ops.is_empty());
+}
+
+#[tokio::test]
 async fn test_sleep() {
     // Configuration retained, data buffer flushed (sleepConfig bit 0 only)
     let mut reference = reference();

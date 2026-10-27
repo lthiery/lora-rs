@@ -228,10 +228,10 @@ where
         })
     }
 
+    // The pin reset leaves the chip in STDBY_RC with BUSY low, ready for
+    // commands (sx128x_reset in SWL2001 is the HAL reset and nothing else)
     async fn reset(&mut self, delay: &mut impl DelayNs) -> Result<(), RadioError> {
-        self.intf.iv.reset(delay).await?;
-        self.set_sleep(false, delay).await?; // ensure sleep mode is entered so that the LoRa mode bit is set
-        Ok(())
+        self.intf.iv.reset(delay).await
     }
 
     async fn ensure_ready(&mut self, mode: RadioMode) -> Result<(), RadioError> {
