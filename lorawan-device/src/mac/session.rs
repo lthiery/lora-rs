@@ -310,6 +310,9 @@ impl Session {
                                 DutResetReq => {
                                     return Response::DeviceHandler(DeviceEvent::ResetDevice);
                                 }
+                                DutFPort224DisableReq => {
+                                    return Response::DeviceHandler(DeviceEvent::DisableFPort224);
+                                }
                                 LinkCheckReq => {
                                     return Response::LinkCheckReq;
                                 }
@@ -876,6 +879,76 @@ mod tests {
             let mut tx: RadioBuffer<256> = RadioBuffer::new();
             mac.certification_setup_send::<_, 256>(&mut SeqRng(0), &mut tx).unwrap();
             assert_eq!(tx.as_mut_for_read().len(), MHDR_LEN + max_mac + MIC_LEN);
+        }
+    }
+
+    #[cfg(feature = "certification")]
+    #[test]
+    fn certification_reset_clears_only_an_otaa_session() {
+        use crate::mac::{Activation, DeviceEvent};
+        use crate::nvm::PersistentIdentity;
+        let identity = PersistentIdentity { join_epoch: 4, ..Default::default() };
+
+        // ABP: the session is kept and the identity untouched.
+        let mut mac = eu868_mac();
+        mac.set_identity(identity);
+        mac.set_session(session());
+        let response = handle_downlink_on_port(&mut mac, 224, &[0x01], 0);
+        assert!(matches!(response, Response::DeviceHandler(DeviceEvent::ResetDevice)));
+        assert!(mac.get_session().is_some());
+        assert_eq!(mac.identity().unwrap().join_epoch, 4);
+
+        // OTAA: the session is cleared, the MAC parameters reset and the epoch
+        // advanced, so a stored session blob is stale.
+        for (cmd, event) in [(0x01, DeviceEvent::ResetDevice), (0x02, DeviceEvent::ResetMac)] {
+            let mut mac = eu868_mac();
+            mac.set_identity(identity);
+            let mut otaa = session();
+            otaa.activation = Activation::Otaa;
+            mac.set_session(otaa);
+            mac.configuration.data_rate = DR::_3;
+            let response = handle_downlink_on_port(&mut mac, 224, &[cmd], 0);
+            match (response, event) {
+                (Response::DeviceHandler(DeviceEvent::ResetDevice), DeviceEvent::ResetDevice)
+                | (Response::DeviceHandler(DeviceEvent::ResetMac), DeviceEvent::ResetMac) => {}
+                (response, event) => panic!("{cmd:#x}: got {response:?}, expected {event:?}"),
+            }
+            assert!(mac.get_session().is_none());
+            assert_eq!(mac.identity().unwrap().join_epoch, 5);
+            assert_eq!(mac.configuration.data_rate, mac.region.get_default_datarate());
+        }
+    }
+
+    #[cfg(feature = "certification")]
+    #[test]
+    fn dut_fport224_disable_closes_the_port_for_good() {
+        use crate::mac::DeviceEvent;
+        use crate::nvm::PersistentIdentity;
+        for with_identity in [true, false] {
+            let mut mac = eu868_mac();
+            if with_identity {
+                mac.set_identity(PersistentIdentity::default());
+            }
+            mac.set_session(session());
+            assert!(mac.certification_enabled());
+
+            // Closing the port counts as a DutResetReq; the ABP session is kept.
+            let response = handle_downlink_on_port(&mut mac, 224, &[0x7E], 0);
+            assert!(matches!(response, Response::DeviceHandler(DeviceEvent::ResetDevice)));
+            assert!(!mac.certification_enabled());
+            assert!(mac.get_session().is_some());
+            if with_identity {
+                assert!(mac.identity().unwrap().fport224_disabled);
+            }
+
+            // FPort 224 is ordinary application data now: an echo request gets no
+            // answer and is delivered as a downlink.
+            let response = handle_downlink_on_port(&mut mac, 224, &[0x08, 1, 2, 3], 1);
+            assert!(matches!(response, Response::DownlinkReceived(1)));
+
+            // A session clear does not reopen it.
+            mac.clear_session();
+            assert!(!mac.certification_enabled());
         }
     }
 

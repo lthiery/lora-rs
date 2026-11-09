@@ -388,7 +388,7 @@ impl Mac {
         snr: i8,
         rf_config: &RfConfig,
     ) -> Response {
-        match &mut self.state {
+        let response = match &mut self.state {
             State::Joined(session) => session.handle_rx::<N, D>(
                 &mut self.region,
                 &mut self.configuration,
@@ -416,7 +416,54 @@ impl Mac {
                 }
             }
             State::Unjoined => Response::NoUpdate,
+        };
+        #[cfg(feature = "certification")]
+        let response = self.apply_device_event(response);
+        response
+    }
+
+    /// Stack side of the certification protocol's device-level requests, run before the
+    /// event reaches the application. DutResetReq and DutJoinReq clear an OTAA session,
+    /// since the test suite expects a fresh join afterwards, and keep an ABP session,
+    /// whose frame counters must never restart. DutFPort224DisableReq closes the port
+    /// for good and then counts as a DutResetReq. The identity may have changed; the
+    /// caller persists it before acting on the event.
+    #[cfg(feature = "certification")]
+    fn apply_device_event(&mut self, response: Response) -> Response {
+        match response {
+            Response::DeviceHandler(DeviceEvent::DisableFPort224) => {
+                self.disable_certification();
+                self.certification_reset();
+                Response::DeviceHandler(DeviceEvent::ResetDevice)
+            }
+            Response::DeviceHandler(DeviceEvent::ResetDevice | DeviceEvent::ResetMac) => {
+                self.certification_reset();
+                response
+            }
+            response => response,
         }
+    }
+
+    #[cfg(feature = "certification")]
+    fn certification_reset(&mut self) {
+        if self.get_session().is_some_and(|s| s.activation == Activation::Otaa) {
+            self.clear_session();
+        }
+    }
+
+    /// Close FPort 224 for good: certification downlinks become ordinary application
+    /// data. Recorded in the identity so a store keeps it across reboots.
+    #[cfg(feature = "certification")]
+    pub(crate) fn disable_certification(&mut self) {
+        self.certification.set_port_disabled(true);
+        if let Some(identity) = self.identity.as_mut() {
+            identity.fport224_disabled = true;
+        }
+    }
+
+    #[cfg(feature = "certification")]
+    pub(crate) fn certification_enabled(&self) -> bool {
+        !self.certification.port_disabled()
     }
 
     /// Handles a received RF frame during RXC window. Returns None if unparseable, fails decryption,
@@ -430,8 +477,8 @@ impl Mac {
         snr: i8,
         rf_config: &RfConfig,
     ) -> Result<Response> {
-        match &mut self.state {
-            State::Joined(session) => Ok(session.handle_rx::<N, D>(
+        let response = match &mut self.state {
+            State::Joined(session) => session.handle_rx::<N, D>(
                 &mut self.region,
                 &mut self.configuration,
                 #[cfg(feature = "certification")]
@@ -443,10 +490,13 @@ impl Mac {
                 rf_config.max_payload_len,
                 snr,
                 true,
-            )),
-            State::Otaa(_) => Err(Error::NotJoined),
-            State::Unjoined => Err(Error::NotJoined),
-        }
+            ),
+            State::Otaa(_) => return Err(Error::NotJoined),
+            State::Unjoined => return Err(Error::NotJoined),
+        };
+        #[cfg(feature = "certification")]
+        let response = self.apply_device_event(response);
+        Ok(response)
     }
 
     pub(crate) fn rx2_complete(&mut self) -> Response {
@@ -500,6 +550,8 @@ impl Mac {
     }
 
     pub(crate) fn set_identity(&mut self, identity: PersistentIdentity) {
+        #[cfg(feature = "certification")]
+        self.certification.set_port_disabled(identity.fport224_disabled);
         self.identity = Some(identity);
     }
 
@@ -515,9 +567,13 @@ impl Mac {
             identity.join_epoch = identity.join_epoch.wrapping_add(1);
             identity
         });
+        #[cfg(feature = "certification")]
+        let port_disabled = self.certification.port_disabled();
         let BoardEirp { max_power, antenna_gain } = self.board_eirp;
         *self = Mac::new(self.region.clone(), max_power, antenna_gain);
         self.identity = identity;
+        #[cfg(feature = "certification")]
+        self.certification.set_port_disabled(port_disabled);
     }
 
     /// Snapshot the active session and negotiated MAC state for persistence.
@@ -659,9 +715,18 @@ pub(crate) enum Response {
 #[derive(Debug)]
 #[cfg(feature = "certification")]
 pub(crate) enum DeviceEvent {
+    /// DutResetReq: the application reboots the device. The MAC has already done its
+    /// part (an OTAA session is cleared, an ABP session kept).
     ResetDevice,
+    /// DutJoinReq: the application joins again. The MAC has already cleared an OTAA
+    /// session.
     ResetMac,
-    TxPeriodicityChange { periodicity: Option<u16> },
+    TxPeriodicityChange {
+        periodicity: Option<u16>,
+    },
+    /// DutFPort224DisableReq, seen by the session layer only; the MAC closes the port
+    /// and reports it as `ResetDevice`.
+    DisableFPort224,
 }
 
 impl From<Response> for nb_device::Response {

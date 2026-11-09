@@ -445,7 +445,12 @@ async fn clear_session_without_a_store_drops_the_live_session() {
 async fn stale_or_corrupt_session_dropped_identity_kept() {
     // Session blob from an older join epoch: identity survives, session does not.
     let store = MockStore::default();
-    let identity = PersistentIdentity { dev_nonce: 7, last_join_nonce: Some(3), join_epoch: 5 };
+    let identity = PersistentIdentity {
+        dev_nonce: 7,
+        last_join_nonce: Some(3),
+        join_epoch: 5,
+        ..Default::default()
+    };
     let mut buf = [0u8; MAX_BLOB_LEN];
     let n = identity.encode(&mut buf);
     store.put(NvmRegion::Identity, &buf[..n]);
@@ -644,8 +649,12 @@ async fn abp_rejoin_with_new_keys_starts_a_fresh_session() {
 #[tokio::test]
 async fn exhausted_dev_nonce_refuses_to_join() {
     let store = MockStore::default();
-    let identity =
-        PersistentIdentity { dev_nonce: u16::MAX, last_join_nonce: Some(3), join_epoch: 5 };
+    let identity = PersistentIdentity {
+        dev_nonce: u16::MAX,
+        last_join_nonce: Some(3),
+        join_epoch: 5,
+        ..Default::default()
+    };
     let mut buf = [0u8; MAX_BLOB_LEN];
     let n = identity.encode(&mut buf);
     store.put(NvmRegion::Identity, &buf[..n]);
@@ -664,7 +673,12 @@ async fn exhausted_dev_nonce_refuses_to_join() {
 #[tokio::test]
 async fn restore_validates_rx2_data_rate_and_keeps_adr() {
     let store = MockStore::default();
-    let identity = PersistentIdentity { dev_nonce: 1, last_join_nonce: Some(1), join_epoch: 1 };
+    let identity = PersistentIdentity {
+        dev_nonce: 1,
+        last_join_nonce: Some(1),
+        join_epoch: 1,
+        ..Default::default()
+    };
     let mut buf = [0u8; MAX_BLOB_LEN];
     let n = identity.encode(&mut buf);
     store.put(NvmRegion::Identity, &buf[..n]);
@@ -697,7 +711,12 @@ async fn restore_validates_rx2_data_rate_and_keeps_adr() {
 
 fn stored_session(channel_mask: [u8; 9]) -> MockStore {
     let store = MockStore::default();
-    let identity = PersistentIdentity { dev_nonce: 1, last_join_nonce: Some(1), join_epoch: 1 };
+    let identity = PersistentIdentity {
+        dev_nonce: 1,
+        last_join_nonce: Some(1),
+        join_epoch: 1,
+        ..Default::default()
+    };
     let mut buf = [0u8; MAX_BLOB_LEN];
     let n = identity.encode(&mut buf);
     store.put(NvmRegion::Identity, &buf[..n]);
@@ -746,6 +765,19 @@ async fn persisted_session_carries_the_channel_mask() {
     assert_eq!(store.session().channel_mask, [0xFF; 9]);
 }
 
+/// Build an FPort 224 downlink with `data` at FCntDown 1 for the ABP test session.
+#[cfg(feature = "certification")]
+fn certification_downlink(data: &[u8], buf: &mut [u8]) -> usize {
+    let frame = DataFrame {
+        frame_type: DataFrameType::UnconfirmedDown,
+        dev_addr: crate::test_util::get_dev_addr(),
+        fcnt: 1,
+        payload: Payload::Data { f_port: NonZeroU8::new(224).unwrap(), data },
+        ..Default::default()
+    };
+    frame.build_into(buf, &get_crypto(), Some(&get_crypto())).unwrap().len()
+}
+
 /// A certification-port downlink that yields a MAC response other than
 /// `DownlinkReceived` still advances FCntDown, which must be persisted.
 #[cfg(feature = "certification")]
@@ -757,14 +789,7 @@ async fn certification_downlink_persists_fcnt_down() {
     assert_eq!(store.session().fcnt_down, None);
 
     fn cp_link_check_req(_uplink: Option<Uplink>, _config: RfConfig, buf: &mut [u8]) -> usize {
-        let frame = DataFrame {
-            frame_type: DataFrameType::UnconfirmedDown,
-            dev_addr: crate::test_util::get_dev_addr(),
-            fcnt: 1,
-            payload: Payload::Data { f_port: NonZeroU8::new(224).unwrap(), data: &[0x20] },
-            ..Default::default()
-        };
-        frame.build_into(buf, &get_crypto(), Some(&get_crypto())).unwrap().len()
+        certification_downlink(&[0x20], buf)
     }
     let task = tokio::spawn(async move {
         let r = device.send(&[1, 2, 3], 3, false).await;
@@ -775,4 +800,82 @@ async fn certification_downlink_persists_fcnt_down() {
     let (_device, response) = task.await.unwrap();
     assert!(matches!(response, Ok(SendResponse::RxComplete)));
     assert_eq!(store.session().fcnt_down, Some(1));
+}
+
+#[cfg(feature = "certification")]
+#[tokio::test]
+async fn closed_certification_port_survives_a_reboot() {
+    let store = MockStore::default();
+    let (radio, timer, mut device) = restore(&store).await;
+    assert!(matches!(device.join(&get_abp_credentials()).await, Ok(JoinResponse::JoinSuccess)));
+    assert!(device.certification_enabled());
+    device.disable_certification().await.unwrap();
+    assert!(!device.certification_enabled());
+    assert!(store.identity().fport224_disabled);
+    drop((radio, timer, device));
+
+    let (radio, timer, mut device) = restore(&store).await;
+    assert!(!device.certification_enabled());
+    assert!(matches!(device.join(&get_abp_credentials()).await, Ok(JoinResponse::JoinSuccess)));
+
+    // A LinkCheckReq on FPort 224 is plain application data now: no MAC command is
+    // queued and the frame reaches the application.
+    fn cp_link_check_req(_uplink: Option<Uplink>, _config: RfConfig, buf: &mut [u8]) -> usize {
+        certification_downlink(&[0x20], buf)
+    }
+    let task = tokio::spawn(async move {
+        let r = device.send(&[1, 2, 3], 3, false).await;
+        (device, r)
+    });
+    timer.fire_most_recent().await;
+    radio.handle_rxtx(cp_link_check_req).await;
+    let (mut device, response) = task.await.unwrap();
+    assert!(matches!(response, Ok(SendResponse::DownlinkReceived(1))));
+    let downlink = device.take_downlink().expect("delivered to the application");
+    assert_eq!(downlink.fport, 224);
+    assert_eq!(downlink.data.as_slice(), &[0x20]);
+}
+
+/// A certification reset event reaches the application only after the identity it
+/// may have changed (epoch, port state) is in the store. The async device has no
+/// application-side handler for these events yet, so the response path is driven
+/// directly.
+#[cfg(feature = "certification")]
+#[tokio::test]
+async fn certification_reset_event_persists_the_identity() {
+    use crate::mac::{DeviceEvent, Response};
+    let store = MockStore::default();
+    let (_radio, _timer, mut device) = restore(&store).await;
+    assert!(matches!(device.join(&get_abp_credentials()).await, Ok(JoinResponse::JoinSuccess)));
+    let identity_saves = store.saves(NvmRegion::Identity);
+
+    let mut buf = [0u8; 256];
+    let len = certification_downlink(&[0x7E], &mut buf);
+    device.radio_buffer.clear();
+    device.radio_buffer.extend_from_slice(&buf[..len]).unwrap();
+    let rf_config = device.mac.get_rxc_config().rf;
+    let response = device.mac.handle_rx::<512, 4>(
+        &mut device.radio_buffer,
+        &mut device.downlink,
+        10,
+        &rf_config,
+    );
+    assert!(matches!(response, Response::DeviceHandler(DeviceEvent::ResetDevice)));
+    assert_eq!(store.saves(NvmRegion::Identity), identity_saves, "not yet persisted");
+
+    let passed_on = Device::handle_mac_response(
+        &mut device.radio_buffer,
+        &mut device.retransmit_buffer,
+        &mut device.mac,
+        &mut device.radio,
+        &mut device.rng,
+        &mut device.nvm,
+        response,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(passed_on, Some(Response::DeviceHandler(DeviceEvent::ResetDevice))));
+    assert_eq!(store.saves(NvmRegion::Identity), identity_saves + 1);
+    assert!(store.identity().fport224_disabled);
 }

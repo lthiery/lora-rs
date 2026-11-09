@@ -73,6 +73,12 @@ use self::radio::RxStatus;
 /// 1.0.4 behavior: monotonic DevNonce, JoinNonce replay protection and session resume across
 /// power loss. The default [`NoNvm`] keeps the stack at LoRaWAN 1.0.2 with no persistence
 /// code compiled in.
+///
+/// With a store, any reset resumes: `restore` rebuilds the session after a power cycle, a
+/// watchdog or a deep sleep that loses RAM, and the device carries on without joining again.
+/// Joining again is the application's decision, made with [`Device::clear_session`]. The one
+/// exception the stack makes is the certification protocol's reset requests, which clear an
+/// OTAA session because the test suite expects a fresh join afterwards.
 pub struct Device<R, T, G, const N: usize = 256, const D: usize = 1, S = NoNvm>
 where
     R: radio::PhyRxTx + Timings,
@@ -339,6 +345,22 @@ where
     pub async fn clear_session(&mut self) -> Result<(), Error<R::PhyError>> {
         self.mac.clear_session();
         self.nvm.persist_identity(&self.mac).await
+    }
+
+    /// Close FPort 224 for good, as the certification protocol's DutFPort224DisableReq
+    /// does over the air: certification downlinks become ordinary application data. With
+    /// a store the closed port survives reboots and [`clear_session`](Self::clear_session).
+    #[cfg(feature = "certification")]
+    pub async fn disable_certification(&mut self) -> Result<(), Error<R::PhyError>> {
+        self.mac.disable_certification();
+        self.nvm.persist_identity(&self.mac).await
+    }
+
+    /// Whether FPort 224 downlinks are processed as certification commands. True on a
+    /// fresh device.
+    #[cfg(feature = "certification")]
+    pub fn certification_enabled(&self) -> bool {
+        self.mac.certification_enabled()
     }
 
     /// Enables Class C behavior. Note that Class C downlinks are not possible until a confirmed
@@ -869,6 +891,14 @@ where
         radio_buffer.clear();
         match response {
             mac::Response::NoUpdate => Ok(None),
+            #[cfg(feature = "certification")]
+            response @ mac::Response::DeviceHandler(_) => {
+                // The MAC may have cleared an OTAA session or closed FPort 224. Both
+                // live in the identity blob and must be durable before the application
+                // acts on the event (reboot, rejoin).
+                nvm.persist_identity(mac).await?;
+                Ok(Some(response))
+            }
             #[cfg(feature = "certification")]
             mac::Response::LinkCheckReq => {
                 let _ = mac.add_uplink(lorawan::maccommandcreator::LinkCheckReqCreator::new());

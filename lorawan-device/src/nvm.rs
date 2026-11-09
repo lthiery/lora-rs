@@ -9,8 +9,9 @@
 //! keep its anti-replay state.
 //!
 //! Two regions are stored, split because their write rates differ by orders of magnitude:
-//! - [`NvmRegion::Identity`]: DevNonce/JoinNonce counters. Written around joins and
-//!   on an explicit session clear, never reset for the life of the device.
+//! - [`NvmRegion::Identity`]: DevNonce/JoinNonce counters and the certification port
+//!   state. Written around joins, on an explicit session clear and when the port is
+//!   closed, never reset for the life of the device.
 //! - [`NvmRegion::Session`]: session keys, frame counters and negotiated MAC state.
 //!   Written on join, on accepted downlinks, and when the uplink counter reaches its
 //!   checkpoint.
@@ -143,6 +144,10 @@ pub struct PersistentIdentity {
     /// Bumps on each successful join and on an explicit session clear; ties a session
     /// blob to this identity. A blob from an older epoch is never resumed.
     pub join_epoch: u32,
+    /// FPort 224 closed for good, by the certification protocol's DutFPort224DisableReq
+    /// or by the application. Only acted on with the `certification` feature; stored
+    /// regardless so the blob layout does not depend on features.
+    pub fport224_disabled: bool,
 }
 
 /// Durable session state, sufficient to resume sending after a cold boot. A dedicated
@@ -190,9 +195,13 @@ pub enum DecodeError {
 
 const MAGIC: [u8; 4] = *b"LWNV";
 const HEADER_LEN: usize = 12;
-const IDENTITY_SCHEMA_VERSION: u8 = 1;
+const IDENTITY_SCHEMA_VERSION: u8 = 2;
+/// Identity blobs of this schema (no port byte) still decode, with the port open, so a
+/// device updated from an earlier build keeps its DevNonce counter.
+const IDENTITY_SCHEMA_V1: u8 = 1;
 const SESSION_SCHEMA_VERSION: u8 = 3;
-const IDENTITY_PAYLOAD_LEN: usize = 10;
+const IDENTITY_PAYLOAD_LEN: usize = 11;
+const IDENTITY_PAYLOAD_LEN_V1: usize = 10;
 const SESSION_PAYLOAD_LEN: usize = 72;
 /// Sentinel encoding of `last_join_nonce: None`; JoinNonce is a 3-byte field on the
 /// wire, so this value can never be a real nonce.
@@ -217,21 +226,21 @@ fn region_tag(region: NvmRegion) -> u8 {
     }
 }
 
-fn schema_version(region: NvmRegion) -> u8 {
+fn schema_supported(region: NvmRegion, schema: u8) -> bool {
     match region {
-        NvmRegion::Identity => IDENTITY_SCHEMA_VERSION,
-        NvmRegion::Session => SESSION_SCHEMA_VERSION,
+        NvmRegion::Identity => schema == IDENTITY_SCHEMA_VERSION || schema == IDENTITY_SCHEMA_V1,
+        NvmRegion::Session => schema == SESSION_SCHEMA_VERSION,
     }
 }
 
 /// Header layout: `magic[4] | region_tag u8 | schema_version u8 | payload_len u16 LE |
 /// crc32 u32 LE`, CRC computed over region_tag, schema_version, payload_len and payload.
-fn encode_blob(region: NvmRegion, payload: &[u8], out: &mut [u8]) -> usize {
+fn encode_blob(region: NvmRegion, schema: u8, payload: &[u8], out: &mut [u8]) -> usize {
     let total = HEADER_LEN + payload.len();
     debug_assert!(out.len() >= total && payload.len() <= u16::MAX as usize);
     out[0..4].copy_from_slice(&MAGIC);
     out[4] = region_tag(region);
-    out[5] = schema_version(region);
+    out[5] = schema;
     out[6..8].copy_from_slice(&(payload.len() as u16).to_le_bytes());
     out[HEADER_LEN..total].copy_from_slice(payload);
     let crc = crc32(crc32(0, &out[4..8]), payload);
@@ -239,14 +248,15 @@ fn encode_blob(region: NvmRegion, payload: &[u8], out: &mut [u8]) -> usize {
     total
 }
 
-fn decode_blob(region: NvmRegion, blob: &[u8]) -> Result<&[u8], DecodeError> {
+/// Returns the blob's schema version and payload.
+fn decode_blob(region: NvmRegion, blob: &[u8]) -> Result<(u8, &[u8]), DecodeError> {
     if blob.len() < HEADER_LEN || blob[0..4] != MAGIC {
         return Err(DecodeError::BadMagic);
     }
     if blob[4] != region_tag(region) {
         return Err(DecodeError::RegionMismatch);
     }
-    if blob[5] != schema_version(region) {
+    if !schema_supported(region, blob[5]) {
         return Err(DecodeError::SchemaVersion);
     }
     let len = u16::from_le_bytes([blob[6], blob[7]]) as usize;
@@ -257,7 +267,7 @@ fn decode_blob(region: NvmRegion, blob: &[u8]) -> Result<&[u8], DecodeError> {
     if crc != crc32(crc32(0, &blob[4..8]), &blob[HEADER_LEN..]) {
         return Err(DecodeError::BadCrc);
     }
-    Ok(&blob[HEADER_LEN..])
+    Ok((blob[5], &blob[HEADER_LEN..]))
 }
 
 impl PersistentIdentity {
@@ -268,12 +278,18 @@ impl PersistentIdentity {
         p[0..2].copy_from_slice(&self.dev_nonce.to_le_bytes());
         p[2..6].copy_from_slice(&self.last_join_nonce.unwrap_or(JOIN_NONCE_NONE).to_le_bytes());
         p[6..10].copy_from_slice(&self.join_epoch.to_le_bytes());
-        encode_blob(NvmRegion::Identity, &p, out)
+        p[10] = self.fport224_disabled as u8;
+        encode_blob(NvmRegion::Identity, IDENTITY_SCHEMA_VERSION, &p, out)
     }
 
     pub fn decode(blob: &[u8]) -> Result<Self, DecodeError> {
-        let p = decode_blob(NvmRegion::Identity, blob)?;
-        if p.len() != IDENTITY_PAYLOAD_LEN {
+        let (schema, p) = decode_blob(NvmRegion::Identity, blob)?;
+        let expected_len = if schema == IDENTITY_SCHEMA_V1 {
+            IDENTITY_PAYLOAD_LEN_V1
+        } else {
+            IDENTITY_PAYLOAD_LEN
+        };
+        if p.len() != expected_len {
             return Err(DecodeError::BadLength);
         }
         let last_join_nonce = u32::from_le_bytes([p[2], p[3], p[4], p[5]]);
@@ -281,6 +297,7 @@ impl PersistentIdentity {
             dev_nonce: u16::from_le_bytes([p[0], p[1]]),
             last_join_nonce: (last_join_nonce != JOIN_NONCE_NONE).then_some(last_join_nonce),
             join_epoch: u32::from_le_bytes([p[6], p[7], p[8], p[9]]),
+            fport224_disabled: schema != IDENTITY_SCHEMA_V1 && p[10] != 0,
         })
     }
 }
@@ -306,11 +323,11 @@ impl PersistentSession {
         p[61] = self.adr_enabled as u8;
         p[62..71].copy_from_slice(&self.channel_mask);
         p[71] = matches!(self.activation, Activation::Otaa) as u8;
-        encode_blob(NvmRegion::Session, &p, out)
+        encode_blob(NvmRegion::Session, SESSION_SCHEMA_VERSION, &p, out)
     }
 
     pub fn decode(blob: &[u8]) -> Result<Self, DecodeError> {
-        let p = decode_blob(NvmRegion::Session, blob)?;
+        let (_, p) = decode_blob(NvmRegion::Session, blob)?;
         if p.len() != SESSION_PAYLOAD_LEN {
             return Err(DecodeError::BadLength);
         }
@@ -350,7 +367,12 @@ mod tests {
     use super::*;
 
     fn identity() -> PersistentIdentity {
-        PersistentIdentity { dev_nonce: 0x1234, last_join_nonce: Some(77), join_epoch: 3 }
+        PersistentIdentity {
+            dev_nonce: 0x1234,
+            last_join_nonce: Some(77),
+            join_epoch: 3,
+            fport224_disabled: true,
+        }
     }
 
     fn session() -> PersistentSession {
@@ -383,10 +405,32 @@ mod tests {
 
     #[test]
     fn identity_roundtrip_no_join_nonce() {
-        let id = PersistentIdentity { dev_nonce: 0, last_join_nonce: None, join_epoch: 0 };
+        let id = PersistentIdentity {
+            dev_nonce: 0,
+            last_join_nonce: None,
+            join_epoch: 0,
+            fport224_disabled: false,
+        };
         let mut buf = [0u8; MAX_BLOB_LEN];
         let len = id.encode(&mut buf);
         assert_eq!(PersistentIdentity::decode(&buf[..len]).unwrap(), id);
+    }
+
+    #[test]
+    fn identity_schema_1_decodes_with_the_port_open() {
+        let mut p = [0u8; IDENTITY_PAYLOAD_LEN_V1];
+        p[0..2].copy_from_slice(&0x1234u16.to_le_bytes());
+        p[2..6].copy_from_slice(&77u32.to_le_bytes());
+        p[6..10].copy_from_slice(&3u32.to_le_bytes());
+        let mut buf = [0u8; MAX_BLOB_LEN];
+        let len = encode_blob(NvmRegion::Identity, IDENTITY_SCHEMA_V1, &p, &mut buf);
+        assert_eq!(
+            PersistentIdentity::decode(&buf[..len]).unwrap(),
+            PersistentIdentity { fport224_disabled: false, ..identity() }
+        );
+        // The schema 1 length under the current schema is still a bad length.
+        let len = encode_blob(NvmRegion::Identity, IDENTITY_SCHEMA_VERSION, &p, &mut buf);
+        assert_eq!(PersistentIdentity::decode(&buf[..len]), Err(DecodeError::BadLength));
     }
 
     #[test]
@@ -457,7 +501,7 @@ mod tests {
     fn crc_covers_header_fields() {
         // Flipping region tag alone must not slip past as the other region's valid blob.
         let mut buf = [0u8; MAX_BLOB_LEN];
-        let id = PersistentIdentity { dev_nonce: 1, last_join_nonce: None, join_epoch: 0 };
+        let id = PersistentIdentity { dev_nonce: 1, ..Default::default() };
         let len = id.encode(&mut buf);
         buf[4] = region_tag(NvmRegion::Session);
         assert!(PersistentSession::decode(&buf[..len]).is_err());
