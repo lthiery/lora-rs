@@ -331,8 +331,10 @@ where
     /// after a reboot. The device is unjoined afterwards and its MAC parameters return
     /// to the region defaults, as on a device that has never joined. The join identity
     /// is kept, so the next OTAA join still uses the monotonic DevNonce. Intended for
-    /// a product that wants a fresh join on demand: a button on the board, a factory
-    /// reset, a test harness between runs. Without a store only the live session is
+    /// an OTAA product that wants a fresh join on demand: a button on the board, a
+    /// factory reset, a test harness between runs. An ABP device has no second session
+    /// to move to; clearing one and activating again with the same keys restarts the
+    /// frame counters, which LoRaWAN forbids. Without a store only the live session is
     /// dropped.
     pub async fn clear_session(&mut self) -> Result<(), Error<R::PhyError>> {
         self.mac.clear_session();
