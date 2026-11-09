@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 
 
 ## Unreleased
 
+- Add optional non-volatile storage to `async_device::Device` (`nvm` module).
+  With a store (`Device::restore`) the device follows the LoRaWAN 1.0.4 join
+  rules (persisted monotonic DevNonce, JoinNonce replay check) and resumes its
+  session across any reset. `Device::clear_session` drops the session for a
+  fresh join; `Device::checkpoint` and `set_checkpoint_margin` control the
+  FCntUp resume point. Without a store nothing changes.
+- Add `Session::activation` (`Activation::Otaa` or `Abp`)
+- certification: persist the FPort 224 state in the identity blob and handle
+  `DutFPort224DisableReq`; `Device::disable_certification` closes the port from
+  the application. DutResetReq and DutJoinReq clear an OTAA session, so the
+  device joins again after the reset, and keep an ABP session
 - certification: clip an EchoIncPayloadAns to the current data rate's maximum payload, counting the MAC answers it carries in FOpts
 - Add `device.take_payload_dropped()` which signals the application to handle cases where pending MAC answers do not fit in FOpts, are sent automatically in FPort 0, and the application payload is dropped
 - Move to Rust edition 2024 (requires Rust 1.85+)
