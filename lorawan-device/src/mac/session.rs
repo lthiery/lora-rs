@@ -36,11 +36,27 @@ use lorawan::{
 #[cfg(feature = "certification")]
 use super::DeviceEvent;
 
+/// How a session was activated. An OTAA session can be dropped and re-derived by a new
+/// join; an ABP session is the device's only session for its lifetime and its frame
+/// counters must never restart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt-03", derive(defmt::Format))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Activation {
+    Otaa,
+    /// Also the marker for a session handed to the stack by the application
+    /// ([`Session::new`]), whose origin the stack cannot know.
+    #[default]
+    Abp,
+}
+
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "defmt-03", derive(defmt::Format))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Session {
     pub uplink: uplink::Uplink,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub activation: Activation,
     pub confirmed: bool,
     pub nwkskey: NwkSKey,
     pub appskey: AppSKey,
@@ -87,15 +103,18 @@ impl Session {
         devnonce: DevNonce,
         credentials: &NetworkCredentials,
     ) -> Self {
-        Self::new(
+        let mut session = Self::new(
             decrypt.derive_nwkskey(devnonce, &DefaultCrypto::new(credentials.appkey().inner())),
             decrypt.derive_appskey(devnonce, &DefaultCrypto::new(credentials.appkey().inner())),
             decrypt.dev_addr(),
-        )
+        );
+        session.activation = Activation::Otaa;
+        session
     }
 
     pub fn new(nwkskey: NwkSKey, appskey: AppSKey, devaddr: DevAddr) -> Self {
         Self {
+            activation: Activation::Abp,
             nwkskey,
             appskey,
             devaddr,

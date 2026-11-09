@@ -20,7 +20,7 @@ pub type FcntUp = u32;
 
 mod session;
 use rand_core::RngCore;
-pub use session::{Session, SessionKeys};
+pub use session::{Activation, Session, SessionKeys};
 
 mod otaa;
 pub use otaa::NetworkCredentials;
@@ -541,6 +541,7 @@ impl Mac {
             tx_power: self.configuration.tx_power,
             adr_enabled: self.configuration.adr_enabled,
             channel_mask,
+            activation: session.activation,
         })
     }
 
@@ -548,6 +549,7 @@ impl Mac {
     /// checkpoint, which is ahead of any counter that went on the air.
     pub(crate) fn restore_session(&mut self, ps: &PersistentSession) {
         let mut session = Session::new(ps.nwkskey, ps.appskey, ps.devaddr);
+        session.activation = ps.activation;
         session.fcnt_up = ps.fcnt_up_checkpoint;
         session.restore_fcnt_down(ps.fcnt_down);
         // Ignore persisted data rates the current region does not support.

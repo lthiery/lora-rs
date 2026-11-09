@@ -23,6 +23,7 @@
 
 use core::fmt::Debug;
 
+use crate::mac::Activation;
 use lorawan::keys::{AppSKey, NwkSKey};
 use lorawan::parser::DevAddr;
 use lorawan::types::DR;
@@ -165,6 +166,9 @@ pub struct PersistentSession {
     pub tx_power: Option<u8>,
     pub adr_enabled: bool,
     pub channel_mask: [u8; 9],
+    /// Decides what a certification reset does to the session: an OTAA session is
+    /// cleared so the device rejoins, an ABP session is kept.
+    pub activation: Activation,
 }
 
 /// Reasons a stored blob was rejected. All are handled by treating the region as
@@ -187,9 +191,9 @@ pub enum DecodeError {
 const MAGIC: [u8; 4] = *b"LWNV";
 const HEADER_LEN: usize = 12;
 const IDENTITY_SCHEMA_VERSION: u8 = 1;
-const SESSION_SCHEMA_VERSION: u8 = 2;
+const SESSION_SCHEMA_VERSION: u8 = 3;
 const IDENTITY_PAYLOAD_LEN: usize = 10;
-const SESSION_PAYLOAD_LEN: usize = 71;
+const SESSION_PAYLOAD_LEN: usize = 72;
 /// Sentinel encoding of `last_join_nonce: None`; JoinNonce is a 3-byte field on the
 /// wire, so this value can never be a real nonce.
 const JOIN_NONCE_NONE: u32 = 0xFFFF_FFFF;
@@ -301,6 +305,7 @@ impl PersistentSession {
         p[60] = self.fcnt_down.is_some() as u8;
         p[61] = self.adr_enabled as u8;
         p[62..71].copy_from_slice(&self.channel_mask);
+        p[71] = matches!(self.activation, Activation::Otaa) as u8;
         encode_blob(NvmRegion::Session, &p, out)
     }
 
@@ -331,6 +336,11 @@ impl PersistentSession {
             tx_power: (p[59] != 0xFF).then_some(p[59]),
             adr_enabled: p[61] != 0,
             channel_mask,
+            activation: if p[71] == 1 {
+                Activation::Otaa
+            } else {
+                Activation::Abp
+            },
         })
     }
 }
@@ -359,6 +369,7 @@ mod tests {
             tx_power: None,
             adr_enabled: false,
             channel_mask: [0x00, 0xFF, 0, 0, 0, 0, 0, 0, 0x02],
+            activation: Activation::Otaa,
         }
     }
 

@@ -355,6 +355,7 @@ async fn session_resumes_after_power_loss() {
     let session = device.get_session().expect("session must resume");
     let keys_after = session.get_session_keys().unwrap();
     assert_eq!(format!("{keys_before:?}"), format!("{keys_after:?}"));
+    assert_eq!(session.activation, crate::mac::Activation::Otaa);
     // FCnt resumes from the persisted checkpoint (join set it to the margin), skipping
     // ahead of the single counter value actually used; never reusing one.
     assert_eq!(session.fcnt_up, crate::nvm::DEFAULT_FCNT_CHECKPOINT_MARGIN);
@@ -463,6 +464,7 @@ async fn stale_or_corrupt_session_dropped_identity_kept() {
         tx_power: None,
         adr_enabled: true,
         channel_mask: [0xFF; 9],
+        activation: crate::mac::Activation::Abp,
     };
     let n = stale.encode(&mut buf);
     store.put(NvmRegion::Session, &buf[..n]);
@@ -604,6 +606,7 @@ async fn abp_session_resumes_after_power_loss() {
     assert!(matches!(device.join(&get_abp_credentials()).await, Ok(JoinResponse::JoinSuccess)));
     assert_eq!(store.saves(NvmRegion::Session), session_saves, "resume must not rewrite");
     assert_eq!(device.get_session().unwrap().fcnt_up, crate::nvm::DEFAULT_FCNT_CHECKPOINT_MARGIN);
+    assert_eq!(device.get_session().unwrap().activation, crate::mac::Activation::Abp);
     let _device = send_no_downlink(&radio, &timer, device).await;
     let mut uplink = radio.get_last_uplink().await;
     let Ok(PhyPayload::Data(data)) = parser::parse(uplink.data_mut()) else {
@@ -681,6 +684,7 @@ async fn restore_validates_rx2_data_rate_and_keeps_adr() {
         tx_power: None,
         adr_enabled: false,
         channel_mask: [0xFF; 9],
+        activation: crate::mac::Activation::Abp,
     };
     let n = session.encode(&mut buf);
     store.put(NvmRegion::Session, &buf[..n]);
@@ -712,6 +716,7 @@ fn stored_session(channel_mask: [u8; 9]) -> MockStore {
         tx_power: None,
         adr_enabled: false,
         channel_mask,
+        activation: crate::mac::Activation::Abp,
     };
     let n = session.encode(&mut buf);
     store.put(NvmRegion::Session, &buf[..n]);
