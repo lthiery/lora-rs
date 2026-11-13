@@ -918,15 +918,16 @@ where
                 persist_identity(store, mac).await?;
                 match event {
                     DeviceEvent::ResetMac => {
-                        mac.reset(true);
+                        mac.reset_mac();
                         Ok(None)
                     }
                     DeviceEvent::ResetDevice => {
                         // Reset the stack and ask the application to reboot the MCU.
                         // The stack-side reset still applies when `reboot` is a
                         // no-op or deferred.
-                        mac.reset(false);
+                        mac.reset_device();
                         reload_identity(store, mac).await.map_err(|_| Error::Nvm)?;
+                        *periodicity_override = None;
                         handler.reboot();
                         Ok(None)
                     }

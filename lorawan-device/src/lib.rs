@@ -77,8 +77,13 @@ pub trait DeviceHandler {
         255
     }
 
-    /// Called after the stack has handled a `DutResetReq` and reset its state,
-    /// so the application can reboot the device or MCU. The default does nothing.
+    /// Called on `DutResetReq`, after the stack has returned to the state it was
+    /// constructed in: unjoined, with default MAC settings, the channel plan the
+    /// application supplied and no multicast sessions. Settings applied after
+    /// construction (data rate, ADR, multicast keys) are gone too, as after an
+    /// MCU reset.
+    ///
+    /// Reboot the MCU here, or re-apply those settings. The default does nothing.
     fn reboot(&mut self) {}
 }
 

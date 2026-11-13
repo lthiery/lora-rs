@@ -112,6 +112,13 @@ impl<F: FixedChannelRegion> RegionHandler for FixedChannelPlan<F> {
         self.channel_mask = channel_mask;
     }
 
+    #[cfg(feature = "certification")]
+    fn reset(&mut self) {
+        self.channel_mask = Default::default();
+        self.channel_selector = Default::default();
+        self.join_channels.restore();
+    }
+
     fn channel_mask_update(
         &self,
         channel_mask: &mut ChannelMask<9>,

@@ -5,6 +5,8 @@ use super::nvm::{MockStore, dev_nonce};
 use super::util;
 use super::util::decrypt_uplink;
 use super::{Device, TestHandler, radio::TestRadio, timer::TestTimer};
+use crate::mac::Mac;
+use crate::region::DR;
 use crate::test_util::{get_crypto, get_dev_addr};
 use lorawan::keys::Crypto;
 
@@ -108,21 +110,55 @@ async fn txframectrlreq_no_change() {
     assert_eq!(net.device().mac.get_session().unwrap().override_confirmed, Some(true));
 }
 
+/// Leave behind the state LinkADRReq, RXParamSetupReq and friends would.
+fn change_mac_state(mac: &mut Mac) {
+    mac.configuration.data_rate = DR::_3;
+    mac.configuration.tx_power = Some(2);
+    mac.configuration.nb_trans = 3;
+    mac.configuration.rx1_delay = 5000;
+    mac.configuration.rx1_dr_offset = 1;
+    mac.configuration.rx2_data_rate = Some(DR::_1);
+    mac.configuration.rx2_frequency = Some(923_900_000);
+    mac.configuration.adr_enabled = false;
+    let default_mask = mac.region.channel_mask_get();
+    let mut mask = default_mask.clone();
+    mask.set_channel(1, false);
+    mac.region.channel_mask_set(mask);
+    assert_ne!(mac.region.channel_mask_get(), default_mask);
+}
+
+fn assert_mac_state_as_constructed(mac: &Mac) {
+    let fresh = Mac::new(crate::region::US915::default().into(), 0, 0);
+    assert!(mac.configuration.data_rate == fresh.configuration.data_rate);
+    assert_eq!(mac.configuration.tx_power, None);
+    assert_eq!(mac.configuration.nb_trans, 1);
+    assert_eq!(mac.configuration.rx1_delay, fresh.configuration.rx1_delay);
+    assert_eq!(mac.configuration.rx1_dr_offset, 0);
+    assert!(mac.configuration.rx2_data_rate.is_none());
+    assert_eq!(mac.configuration.rx2_frequency, None);
+    assert!(mac.configuration.adr_enabled);
+    assert_eq!(mac.region.channel_mask_get(), fresh.region.channel_mask_get());
+}
+
 #[tokio::test]
 async fn dut_join_req_resets_the_mac() {
     let (radio, timer, device) = util::setup_with_session();
     let mut net = Net::new(radio, timer, device).await;
+    change_mac_state(&mut net.device().mac);
 
     let r = net.exchange(&[1, 2, 3], 3, false, ExchangeAction::rx1(Pkt::cp_cmd("02"))).await;
     r.expect_rx_complete();
 
     assert!(net.device().get_session().is_none());
+    assert_mac_state_as_constructed(&net.device().mac);
 }
 
 #[tokio::test]
 async fn dut_reset_req_resets_the_device() {
     let (radio, timer, device) = util::setup_with_session_and_handler(TestHandler::default());
     let mut net = Net::new(radio, timer, device).await;
+    change_mac_state(&mut net.device().mac);
+    net.device().override_periodicity = Some(5);
 
     let r = net.exchange(&[1, 2, 3], 3, false, ExchangeAction::rx1(Pkt::cp_cmd("01"))).await;
     r.expect_rx_complete();
@@ -130,6 +166,8 @@ async fn dut_reset_req_resets_the_device() {
     // Without a store there is nothing to resume, so the device restarts unjoined.
     assert!(net.device().get_session().is_none());
     assert_eq!(net.device().handler.reboots.load(Ordering::SeqCst), 1);
+    assert_mac_state_as_constructed(&net.device().mac);
+    assert_eq!(net.device().get_override_periodicity(), None);
 }
 
 #[tokio::test]

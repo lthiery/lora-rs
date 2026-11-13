@@ -521,13 +521,12 @@ impl WaitingForRx {
             mac::Response::DeviceHandler(event) => {
                 match event {
                     mac::DeviceEvent::ResetDevice => {
-                        // No store-backed 1.0.4 yet: drop the session and ask the
-                        // application to reboot.
-                        mac.reset(false);
+                        // Reset the stack and ask the application to reboot the MCU.
+                        mac.reset_device();
                         handler.reboot();
                     }
                     mac::DeviceEvent::ResetMac => {
-                        mac.reset(true);
+                        mac.reset_mac();
                     }
                     _ => {
                         warn!("nb_device: ignoring certification device event");

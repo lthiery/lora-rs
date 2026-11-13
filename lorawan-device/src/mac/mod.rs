@@ -93,6 +93,25 @@ pub struct Configuration {
     pub(crate) nb_trans: u8,
 }
 
+impl Configuration {
+    /// The settings a device starts with, before the network or the application
+    /// changes any of them.
+    fn new(region: &region::Configuration) -> Self {
+        Self {
+            data_rate: region.get_default_datarate(),
+            rx1_delay: region::constants::RECEIVE_DELAY1,
+            rx1_dr_offset: 0,
+            join_accept_delay1: region::constants::JOIN_ACCEPT_DELAY1,
+            join_accept_delay2: region::constants::JOIN_ACCEPT_DELAY2,
+            rx2_data_rate: None,
+            rx2_frequency: None,
+            tx_power: None,
+            adr_enabled: true,
+            nb_trans: 1,
+        }
+    }
+}
+
 pub(crate) struct Mac {
     pub configuration: Configuration,
     pub region: region::Configuration,
@@ -148,25 +167,13 @@ pub(crate) type Result<T = ()> = core::result::Result<T, Error>;
 
 impl Mac {
     pub(crate) fn new(region: region::Configuration, max_power: u8, antenna_gain: i8) -> Self {
-        let data_rate = region.get_default_datarate();
         Self {
             board_eirp: BoardEirp { max_power, antenna_gain },
+            configuration: Configuration::new(&region),
             region,
             state: State::Unjoined,
             payload_dropped: false,
             identity: None,
-            configuration: Configuration {
-                data_rate,
-                rx1_delay: region::constants::RECEIVE_DELAY1,
-                rx1_dr_offset: 0,
-                join_accept_delay1: region::constants::JOIN_ACCEPT_DELAY1,
-                join_accept_delay2: region::constants::JOIN_ACCEPT_DELAY2,
-                rx2_data_rate: None,
-                rx2_frequency: None,
-                tx_power: None,
-                adr_enabled: true,
-                nb_trans: 1,
-            },
             #[cfg(feature = "certification")]
             certification: certification::Certification::new(),
             #[cfg(feature = "certification")]
@@ -424,17 +431,28 @@ impl Mac {
         }
     }
 
-    /// Drop the running MAC state. With `keep_identity`, the durable join counters and
-    /// FPort 224 state are retained; otherwise the identity is cleared and certification
-    /// returns to its default state.
+    /// Return the MAC layer to the state it was constructed in: no session, default
+    /// settings and the channel plan the application supplied. The durable join
+    /// counters and FPort 224 state are kept.
     #[cfg(feature = "certification")]
-    pub(crate) fn reset(&mut self, keep_identity: bool) {
+    pub(crate) fn reset_mac(&mut self) {
         self.state = State::Unjoined;
         self.payload_dropped = false;
         self.pending_cert_rx = None;
-        if !keep_identity {
-            self.identity = None;
-            self.certification = certification::Certification::new();
+        self.region.reset();
+        self.configuration = Configuration::new(&self.region);
+    }
+
+    /// Return the whole stack to the state it was constructed in, as an MCU reset
+    /// would. A device with a store reloads the identity afterwards.
+    #[cfg(feature = "certification")]
+    pub(crate) fn reset_device(&mut self) {
+        self.reset_mac();
+        self.identity = None;
+        self.certification = certification::Certification::new();
+        #[cfg(feature = "multicast")]
+        {
+            self.multicast = multicast::Multicast::new();
         }
     }
 

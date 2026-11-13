@@ -136,6 +136,11 @@ impl<R: DynamicChannelRegion> RegionHandler for DynamicChannelPlan<R> {
         self.channel_mask.clone()
     }
 
+    #[cfg(feature = "certification")]
+    fn reset(&mut self) {
+        *self = Self::new(self.frequency_valid);
+    }
+
     fn channel_mask_set(&mut self, channel_mask: ChannelMask<9>) {
         self.channel_mask = channel_mask;
     }
